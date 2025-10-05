@@ -6,3 +6,10 @@ The structure followed in the program:
 
 
 <img width="436" height="380" alt="image" src="https://github.com/user-attachments/assets/e0e20a01-4a63-4c78-b9c9-4d3b7b8d44e0" />
+
+
+Important notes:
+- If you need to modify the resolution, adjust the time to minutes in simulation_time=90.
+- For gpkg_path and csv_path to work it's important to put all the clusters in the same file and then follow the            structure shown previusly.
+
+

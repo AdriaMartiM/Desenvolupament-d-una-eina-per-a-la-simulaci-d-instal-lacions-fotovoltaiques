@@ -2159,7 +2159,7 @@ if __name__ == "__main__":
     # 2. Optimize Panel Placement
     optimizer = SolarPanelOptimizer(cluster)
     panels = optimizer.optimize_placement()
-    optimizer.plot_edge_start_points()
+    #optimizer.plot_edge_start_points()
 
     print(f"Paneles colocados: {len(panels)}")
     print(f"Área total: {sum(p.area for p in panels):.2f} m²")
@@ -2187,10 +2187,10 @@ if __name__ == "__main__":
     simulator = PVlibSimulator(cluster=cluster, tilt_dict=tilt_results,
                             panel_point_details=associator.panel_point_details,
                             )
-    plot_tilt_results(cluster.geometry, panels, tilt_results)
+    #plot_tilt_results(cluster.geometry, panels, tilt_results)
     print(simulator.weather.index[0], simulator.weather.index[-1])
    
-    simulator.plot_panel_power_and_horizon(panel_id=5, fecha='1990-01-21', window_minutes=1)
+    #simulator.plot_panel_power_and_horizon(panel_id=5, fecha='1990-01-21', window_minutes=1)
     #simulator.compute_and_save_csv(filename="results450w.csv", workers=4)
     simulator.info_important()
     #simulator.plot_total_POA()
@@ -2205,11 +2205,11 @@ if __name__ == "__main__":
         time_zone=cluster.time_zone
     )"""
     
-    """runner = ProjectRunner()
+    runner = ProjectRunner()
     runner.plot_all_buildings_side_by_side(
         base_dir="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià",
         lat=cluster.lat,
         lon=cluster.lon,
         simulation_time=cluster.simulation_time,  # 👈 Redueix per proves
         time_zone=cluster.time_zone
-    )"""
+    )

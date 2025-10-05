@@ -1,0 +1,2 @@
+# Desenvolupament-d-una-eina-per-a-la-simulaci-d-instal-lacions-fotovoltaiques
+S'ha creat un programa orientat a l’optimització de sistemes fotovoltaics en entorns urbans. L’objectiu principal és dissenyar una eina capaç de generar perfils detallats de plaques solars, calcular els guanys energètics i realitzar estimacions a gran escala, abastant des de teulades individuals fins a ciutats i barris sencers.

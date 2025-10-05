@@ -1,0 +1,2215 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches 
+import geopandas as gpd
+import pvlib
+from typing import Optional
+from typing import List, Tuple
+from shapely.geometry import Polygon, box, Point
+from shapely.affinity import rotate, translate, scale
+from shapely.ops import unary_union
+from matplotlib.patches import Polygon as MplPolygon
+from scipy.spatial import KDTree
+from pvlib import solarposition
+from pvlib import pvsystem, modelchain, temperature, location, iotools
+from pvlib.location import Location
+from pvlib.modelchain import ModelChain
+from pvlib.pvsystem import PVSystem, retrieve_sam
+from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
+from joblib import Parallel, delayed
+from concurrent.futures import ProcessPoolExecutor
+from pvlib.modelchain import ModelChain
+import random
+from pvlib.iotools import get_pvgis_tmy
+import gc
+import os
+from scipy.interpolate import Rbf
+from scipy.spatial import cKDTree
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import Normalize
+from matplotlib import cm
+import time
+
+class Cluster:
+    """ Aquesta clase serveix per inicialitzar totes les cariables que ens faran falta mes endevant, d'aquesta manera
+        tindrem la info del cluster en tot moment.
+        Esquema que fa la clase?
+            -Carrega l'arxiu gpkg i assigna i treu totes les varibles dessitjades
+            -Convertim la info de la geometría en coordenades per un ús més facil
+            -Creem una def per tindre el plot del gpkg i poder validar la informació
+            -Carreguem l'arxiu CSV i obtenim l'informació relelvant
+            -Obteinim el nombre de punts totals
+            -Creem un plot per les dades
+        No hi ha cap plot ben fet doncs ja tinc un altre arxiu més centrat a fer plots de grafiques
+    """
+    def __init__(self, cluster_id: int, gpkg_path: str, csv_path: str, lat: float, lon: float, simulation_time: float, time_zone: str, panel_w=1.0, panel_l=1.7, sep_row=0.05,):
+        self.id = cluster_id
+        self.gpkg_path = gpkg_path
+        self.csv_path = csv_path
+        self.lat = lat
+        self.lon = lon 
+        self.simulation_time = simulation_time
+        self.time_zone = time_zone
+        self.panel_w = panel_w
+        self.panel_l = panel_l
+        self.sep_row = sep_row 
+
+        self.azimuth = None
+        self.tilt = None
+        self.silhouette = None
+        self.geometry = None
+        self.coordinates = []
+        self.points = []
+        
+        self._load_gpkg_data()
+        self._load_csv_data()
+
+    def _load_gpkg_data(self): #Carga el GPKG i extreu les dades del cluster
+        try:
+            gdf = gpd.read_file(self.gpkg_path)
+            
+            if 'cluster' in gdf.columns:
+                cluster_data = gdf[gdf['cluster'] == self.id].iloc[0]
+            else:
+                cluster_data = gdf.iloc[self.id - 1]  
+            
+            # Asignació corecta de les propietats
+            self.azimuth = float(cluster_data['azimuth'])
+            self.tilt = float(cluster_data['tilt'])
+            self.silhouette = float(cluster_data['silhouette'])
+            self.geometry = cluster_data.geometry
+            self.coordinates = self._extract_coords(cluster_data.geometry)
+            
+            # En cas d'error, mostrar on es troba el problema
+        except Exception as e:
+            available_cols = gdf.columns.tolist() if 'gdf' in locals() else []
+            raise ValueError(
+                f"Error cargando GPKG para cluster {self.id}.\n"
+                f"Columnas disponibles: {available_cols}\n"
+                f"Error: {str(e)}"
+            )
+
+    def _extract_coords(self, geom): #Convierte la geometría a coordenades
+    
+        if geom.geom_type == 'MultiPolygon':
+            return [list(poly.exterior.coords) for poly in geom.geoms]
+        elif geom.geom_type == 'Polygon':
+            return [list(geom.exterior.coords)]
+        return []
+
+    def mostrar_dades_gpkg(self): #Mostrem les dades del GPKG
+        print("\n=== Dades del GPKG ===")
+        print(f"Cluster ID: {self.id}")
+        print(f"Azimuth: {self.azimuth}°")
+        print(f"Silhouette score: {self.silhouette}")
+        print(f"Tilt: {self.tilt}°")
+        if self.coordinates:
+            print(f"Primeres coordenades: {self.coordinates[0][:2]}... (total: {len(self.coordinates[0])} punts)")
+
+    def _load_csv_data(self): #Carrega el CSV i extreu les dades dels punts
+        try:
+            df = pd.read_csv(self.csv_path)
+            self.points = [{
+                'x': row[0],
+                'y': row[1],
+                'z': row[2],
+                'shading': row[3:363].tolist()
+            } for _, row in df.iterrows()]
+        except Exception as e:
+            raise ValueError(f"Error cargando CSV: {str(e)}")
+
+    def get_point_count(self) -> int: #Retorna el nombre de punts
+        return len(self.points)
+
+    def mostrar_dades_csv(self, num_points: Optional[int] = None): #Mostrem els punts del CSV
+        points_to_show = self.points[:num_points] if num_points else self.points
+        for i, point in enumerate(points_to_show, 1):
+            print(f"Punt {i}: ({point['x']}, {point['y']}, {point['z']})")
+            print(f"  Perfil d'ombra (5 valors): {point['shading'][:5]}...")
+
+    def _crear_carpeta_resultats(self) -> str:
+            """
+            Crea la carpeta 'Resultats' dins la carpeta de l'edifici.
+            """
+            building_root = os.path.dirname(os.path.dirname(self.gpkg_path))
+            results_dir = os.path.join(building_root, "Resultats")
+            os.makedirs(results_dir, exist_ok=True)
+            return results_dir
+
+
+class SolarPanelOptimizer:
+    """ Aquesta classe té com a principal obectiu optimitzar la posició de les plaques solars dintre un cluster concret
+        Que fa aquesta classe? (Això és l'esquema principal el programa és millor explicat després)
+            -Rotem els panels perque quadrin amb el cluster (Tant azimut com tilt)
+            -Creem una def que inicalitza una panell en coordenades x,y
+            -Mirem si la posició té sentit i no trenca cap regla
+            -Busca l'inici del cluster, donant un input incial que indica per on començar
+            -Fa avançar la linea desde la posició triada
+            -Calcula quanta superficie hem tapat
+            -Optimitza el proces per aconseguir el millor resultat
+            -Plot sencill per comprovar que funciona
+    """
+    def __init__(self, cluster):
+        self.cluster = cluster
+        self.geometry = cluster.geometry  
+        self.tilt = cluster.tilt          
+        self.shading_data = cluster.points 
+
+        self.panel_w = cluster.panel_w
+        self.panel_l = cluster.panel_l
+        self.sep_row = cluster.sep_row  
+
+        # 1️⃣ Crear primer el panell base (sense rotació)
+        self.base_panel = box(-self.panel_w / 2, -self.panel_l / 2, self.panel_w / 2, self.panel_l / 2)
+
+        # 2️⃣ Assignar el azimut inicial del cluster
+        self.azimuth = cluster.azimuth
+
+        # 3️⃣ Recalcula l'azimut si tilt < 5
+        self.tilt_or_flat()
+
+        # 4️⃣ Ara sí podem rotar el panell segons l'azimut final
+        self.rotated_panel = self._rotate_panel(self.base_panel)
+
+        # 5️⃣ Direccions principals
+        self.main_dir = np.array([np.cos(np.radians(self.azimuth)), 
+                                np.sin(np.radians(self.azimuth))])
+        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
+
+        self.covered_area = None
+
+    def tilt_or_flat(self):
+        tilt = getattr(self.cluster, 'tilt', 0)
+        if tilt < 5:
+            print("[INFO] Tilt <5° - Calculando azimut óptimo...")
+            original_az = self.azimuth
+            self.azimuth = self._azimut_personalitzat()
+            print(f"[RESULTADO] Azimut cambiado de {original_az}° a {self.azimuth}°")
+        else:
+            print(f"[INFO] Tilt = {tilt}° - Usando azimut del cluster: {self.azimuth}°")
+        
+        # 🔄 Conversión de azimut GIS → sistema matemático de shapely
+        self.azimuth = (90 - self.azimuth) % 360
+        
+        # Actualizar direcciones
+        self.main_dir = np.array([np.cos(np.radians(self.azimuth)), 
+                                np.sin(np.radians(self.azimuth))])
+        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
+        
+        # Rotar panel según azimut convertido
+        self.rotated_panel = self._rotate_panel(self.base_panel)
+
+    def _azimut_personalitzat(self) -> float:
+        """Determina el azimut óptimo considerando el perfil de sombras"""
+        # 1. Orientación base por hemisferio
+        az_base = 180.0 if self.cluster.lat >= 0 else 0.0
+
+        # 2. Si no hay datos de sombreado, usar orientación base
+        if not hasattr(self.cluster, 'points') or len(self.cluster.points) == 0:
+            print("[AVISO] No hay datos de sombreado. Usando orientación base.")
+            return az_base
+
+        # 3. Calcular perfil de sombra promedio
+        shading_data = np.array([p['shading'] for p in self.cluster.points])
+        shading_profile = np.mean(shading_data, axis=0)
+
+        # Función auxiliar: sombreado medio en ventana ±30°
+        def sombra_media(az):
+            az = int(az) % 360
+            idx_ini = (az - 30) % 360
+            idx_fin = (az + 30) % 360
+            if idx_ini < idx_fin:
+                return np.mean(shading_profile[idx_ini:idx_fin])
+            else:  # ventana que cruza 0°
+                return np.mean(np.concatenate((shading_profile[idx_ini:], shading_profile[:idx_fin])))
+
+        # 4. Definir rango permitido (±30° alrededor del az_base)
+        az_min = (az_base - 30) % 360
+        az_max = (az_base + 30) % 360
+
+        # 5. Generar candidatos cada 5° en ese rango
+        candidatos = []
+        for offset in range(-30, 31, 5):
+            az_candidate = (az_base + offset) % 360
+            candidatos.append(az_candidate)
+
+        # 6. Evaluar todos los candidatos y quedarse con el mejor
+        best_az = az_base
+        best_shade = sombra_media(az_base)
+
+        for az in candidatos:
+            current_shade = sombra_media(az)
+            if current_shade < best_shade:
+                best_az = az
+                best_shade = current_shade
+
+        
+        print(f"[OPTIM] Azimut óptimo: {best_az:.1f}°")
+        return (90 - best_az) % 360
+
+    def _rotate_panel(self, panel):    #Rota el panel en direcció al azimur i al tilt del cluster
+        panel = rotate(panel, self.azimuth, origin=(0,0))   #Aixi les plaques estan orientades en direcció al cluster
+        return scale(panel, 1, np.cos(np.radians(self.tilt)), origin=(0,0)) #reduim les dimensions al tilt per simular el 3D en un pla 2D
+
+    def _create_panel(self, x, y):                  #Serveix per crear un panel en una posicio x,y per especificar
+        return translate(self.rotated_panel, x, y)  #Aplica la funció de rotar al panel en la direccio x,y
+
+    def _is_valid_placement(self, panel, existing_panels):
+       
+        # 1a comprovació: El panel ha d'estar dins dels límits del cluster
+        if not self.geometry.contains(panel):               
+            return False  # El panel està fora dels límits permessos
+            
+        # 2a comprovació: Verificació ràpida de solapament 
+        panel_bounds = panel.bounds  # Obtenim els límits del rectangle que conté el panel
+        for p in existing_panels:
+            p_bounds = p.bounds  # Límits dels panells existents
+            
+            # Comprovem si els rectangles es solapen
+            if (panel_bounds[0] < p_bounds[2] and panel_bounds[2] > p_bounds[0] and
+                panel_bounds[1] < p_bounds[3] and panel_bounds[3] > p_bounds[1]):
+                # Si els rectangles es solapen, verifiquem amb precisió
+                if panel.intersects(p):
+                    return False  # Hi ha solapament geomètric
+        
+        # 3a comprovació: Respectar la distància mínima entre panells (self.sep)
+        if existing_panels:
+            min_distance = min(panel.distance(p) for p in existing_panels)  # Distància mínima a qualsevol panel existent
+            if min_distance < self.sep_row:
+                return False  # Violació de la separació mínima
+                
+        # Si passa totes les comprovacions, la posició és vàlida
+        return True
+
+    def _get_edge_start_points(self, num_points=6):
+        """
+        Genera punts inicials al llarg d'una línia que travessa el cluster
+        en la direcció principal (azimutal), des de banda a banda.
+        """
+        # Centroid del cluster
+        centroid = self.geometry.centroid
+        center = np.array([centroid.x, centroid.y])
+
+        # Direcció principal i perpendicular
+        main_vec = self.main_dir / np.linalg.norm(self.main_dir)
+
+        # Trobar el punt d'inici i final del segment dins del polygon
+        # Avancem cap endavant fins sortir del polygon
+        max_dist = max(self.geometry.bounds[2]-self.geometry.bounds[0],
+                    self.geometry.bounds[3]-self.geometry.bounds[1]) * 2  # suficient llarg
+        start_pos = center.copy()
+        while self.geometry.contains(Point(start_pos)):
+            start_pos -= main_vec  # mou cap enrere fins fora
+        start_pos += main_vec  # retrocedim un pas dins
+
+        end_pos = center.copy()
+        while self.geometry.contains(Point(end_pos)):
+            end_pos += main_vec
+        end_pos -= main_vec  # pas dins
+
+        # Generem punts distribuïts entre start_pos i end_pos
+        points = [start_pos + (end_pos - start_pos) * i / (num_points-1) for i in range(num_points)]
+
+        return points
+
+    def _place_systematic_row(self, start_point, existing_panels):
+        """Versió que permet començar files des de fora del cluster"""
+        panels = []
+        step_size = (self.panel_w + self.sep_row)
+        step_vector = step_size * self.main_dir
+        
+        # Versió cap endavant - permet començar des de fora
+        pos = np.array(start_point, dtype=np.float64)
+        forward_panels = []
+        outside_cluster = not self.geometry.contains(Point(pos))
+        reentry_attempts = 0
+        max_reentry_attempts = 50  # Augmentem els intents per tornar a entrar
+        
+        for i in range(100):  # Augmentem el límit d'iteracions
+            panel = self._create_panel(pos[0], pos[1])
+            
+            # Comprovem si està dins del cluster i és vàlid
+            if self.geometry.contains(Point(pos)):
+                if self._is_valid_placement(panel, existing_panels + forward_panels):
+                    forward_panels.append(panel)
+                    if outside_cluster:
+                        outside_cluster = False
+                    reentry_attempts = 0
+                # Si està dins però no és vàlid (col·lisions), continuem
+            else:
+                # Estem fora del cluster
+                if not outside_cluster:
+                    outside_cluster = True
+                    reentry_attempts = 0
+                
+                reentry_attempts += 1
+            
+            # Movem a la següent posició
+            pos += step_vector
+            
+            # Si portem massa intents sense tornar a entrar, aturem
+            if outside_cluster and reentry_attempts >= max_reentry_attempts:
+                break
+        
+        # Versió cap enrere - mateixa lògica
+        pos = np.array(start_point, dtype=np.float64) - step_vector
+        backward_panels = []
+        outside_cluster = not self.geometry.contains(Point(pos))
+        reentry_attempts = 0
+        
+        for i in range(300):
+            panel = self._create_panel(pos[0], pos[1])
+            
+            if self.geometry.contains(Point(pos)):
+                if self._is_valid_placement(panel, existing_panels + backward_panels + forward_panels):
+                    backward_panels.append(panel)
+                    if outside_cluster:
+                        outside_cluster = False
+                    reentry_attempts = 0
+            else:
+                if not outside_cluster:
+                    outside_cluster = True
+                    reentry_attempts = 0
+                
+                reentry_attempts += 1
+            
+            pos -= step_vector
+            
+            if outside_cluster and reentry_attempts >= max_reentry_attempts:
+                break
+        
+        # Concatenar resultats (en ordre correcte)
+        return backward_panels[::-1] + forward_panels
+
+    def _get_coverage(self, panels):
+        """Calcula el porcentaje de área cubierta"""
+        if not panels:
+            return 0.0
+        union = unary_union(panels)
+        return union.area / self.geometry.area * 100    #Calcul simple per obtindre el porcentatge cobert
+
+    def optimize_placement(self, num_points=6):
+        """Optimiza la colocación de paneles, comparando azimuts para tilt <5°"""
+        tilt = getattr(self.cluster, 'tilt', 0)
+        
+        # Configurar separación según temporada
+        if tilt < 5:
+            alpha_hivern = 90 - (self.cluster.lat + 23.45)
+            self.sep_perp = (self.panel_l * np.sin(np.radians(17.7))) / np.tan(np.radians(alpha_hivern))
+        else:
+            self.sep_perp = self.sep_row
+        
+        # Para tejados con baja inclinación, comparamos dos escenarios
+        if tilt < 5:
+            print("[INFO] Tilt <5° - Comparando escenarios de azimut...")
+            
+            # ESCENARIO 1: Azimut personalizado (ya calculado por el programa)
+            az_personalizado = self.azimuth
+            print(f"Escenario 1: Optimizando con azimut personalizado ({az_personalizado}°)")
+            
+            # Optimizar con azimut personalizado
+            best_panels_personalizado = self._optimize_single_scenario(num_points)
+            coverage_personalizado = self._get_coverage(best_panels_personalizado)
+            
+            # ESCENARIO 2: Azimut del tejado (sin la conversión GIS→matemática)
+            az_tejado = self.cluster.azimuth  # Azimut original del cluster
+            print(f"Escenario 2: Optimizando con azimut del tejado ({az_tejado}°)")
+            
+            # Guardar estado actual
+            original_azimuth = self.azimuth
+            original_main_dir = self.main_dir.copy()
+            original_perp_dir = self.perp_dir.copy()
+            original_rotated_panel = self.rotated_panel
+            
+            # Configurar azimut del tejado (conversión GIS→matemática)
+            self.azimuth = (90 - az_tejado) % 360
+            self.main_dir = np.array([np.cos(np.radians(self.azimuth)), np.sin(np.radians(self.azimuth))])
+            self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
+            self.rotated_panel = self._rotate_panel(self.base_panel)
+            
+            # Optimizar con azimut del tejado
+            best_panels_tejado = self._optimize_single_scenario(num_points)
+            coverage_tejado = self._get_coverage(best_panels_tejado)
+            
+            # Restaurar estado original
+            self.azimuth = original_azimuth
+            self.main_dir = original_main_dir
+            self.perp_dir = original_perp_dir
+            self.rotated_panel = original_rotated_panel
+            
+            # Comparar resultados
+            print(f"\n[COMPARACIÓN]")
+            print(f"Azimut personalizado: {len(best_panels_personalizado)} paneles, {coverage_personalizado:.2f}% cobertura")
+            print(f"Azimut del tejado: {len(best_panels_tejado)} paneles, {coverage_tejado:.2f}% cobertura")
+
+            # 📊 Calcular multiplicador dinámico según el perfil de sombras
+            if hasattr(self.cluster, "points") and len(self.cluster.points) > 0:
+                shading_data = np.array([p['shading'] for p in self.cluster.points])
+                shading_profile = np.mean(shading_data, axis=0)
+                avg_shade = np.mean(shading_profile) / 100.0  # si el CSV va de 0–100
+                multiplier = 1.0 + avg_shade
+            else:
+                multiplier = 1.2  # fallback por defecto si no hay datos
+            print(f"[INFO] Multiplicador dinámico = {multiplier:.2f}")
+
+            # 📌 Decidir con multiplicador dinámico
+            if len(best_panels_tejado) >= len(best_panels_personalizado) * multiplier:
+                print(f"[DECISIÓN] Usando azimut del tejado (≥{multiplier:.2f}x más paneles)")
+                best_panels = best_panels_tejado
+                best_coverage = coverage_tejado
+                self.azimuth = (90 - az_tejado) % 360
+            else:
+                print("[DECISIÓN] Usando azimut personalizado")
+                best_panels = best_panels_personalizado
+                best_coverage = coverage_personalizado
+
+            
+            # Actualizar direcciones según la decisión final
+            self.main_dir = np.array([np.cos(np.radians(self.azimuth)), np.sin(np.radians(self.azimuth))])
+            self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
+            self.rotated_panel = self._rotate_panel(self.base_panel)
+            
+        else:
+            # Para inclinaciones ≥5°, proceder normalmente
+            best_panels = self._optimize_single_scenario(num_points)
+            best_coverage = self._get_coverage(best_panels)
+        
+        print(f"\nMejor cobertura final: {best_coverage:.2f}% con {len(best_panels)} paneles")
+        return best_panels
+
+    def _optimize_single_scenario(self, num_points):
+        """Optimiza la colocación para el azimut actualmente configurado"""
+        start_lines = self._get_edge_start_points(num_points=num_points)
+        best_panels = []
+        best_coverage = 0.0
+        
+        for idx, start_point in enumerate(start_lines):
+            panels = []
+            added_in_this_pass = True
+            attempt = 0
+            max_attempts = 10
+            
+            while attempt < max_attempts and added_in_this_pass:
+                added_in_this_pass = False
+                main_row = self._place_systematic_row(start_point, panels)
+                
+                if main_row:
+                    panels.extend(main_row)
+                    added_in_this_pass = True
+                
+                # Expansión perpendicular
+                for sign in [1, -1]:
+                    current_pos = np.array(start_point) + sign * (self.panel_l + self.sep_perp) * self.perp_dir
+                    rows_added = 0
+                    global_fail_count = 0
+                    max_global_fail_count = 5
+                    
+                    while rows_added < 20 and global_fail_count < max_global_fail_count:
+                        found_row = False
+                        
+                        for jump in range(0, 15):
+                            test_pos = current_pos + sign * jump * (self.panel_l + self.sep_perp) * self.perp_dir
+                            new_row = self._place_systematic_row(test_pos, panels)
+                            
+                            if new_row:
+                                panels.extend(new_row)
+                                added_in_this_pass = True
+                                rows_added += 1
+                                current_pos = test_pos
+                                global_fail_count = 0
+                                found_row = True
+                                break
+                        
+                        if not found_row:
+                            global_fail_count += 1
+                        
+                        current_pos += sign * (self.panel_l + self.sep_perp) * self.perp_dir
+                
+                if not added_in_this_pass:
+                    attempt += 1
+            
+            coverage = self._get_coverage(panels)
+            if coverage > best_coverage:
+                best_coverage = coverage
+                best_panels = panels
+        
+        return best_panels
+
+    def visualize(self, panels, show_arrows=True, show_start_points=True):
+
+        fig, ax = plt.subplots(figsize=(12, 12))
+
+        # 🔷 Dibuixar el cluster
+        if isinstance(self.geometry, Polygon):
+            x, y = self.geometry.exterior.xy
+            ax.fill(x, y, alpha=0.3, color='lightblue', label='Cluster')
+            ax.plot(x, y, color='blue', linewidth=0.5)
+        else:
+            for poly in self.geometry.geoms:
+                x, y = poly.exterior.xy
+                ax.fill(x, y, alpha=0.3, color='lightblue', label='Cluster')
+                ax.plot(x, y, color='blue', linewidth=0.5)
+
+        # 🟩 Dibuixar els panells
+        print(f"[INFO] Mostrant {len(panels)} panells col·locats")
+        cmap = plt.cm.Greens
+        for i, panel in enumerate(panels):
+            x, y = panel.exterior.xy
+            ax.fill(x, y, color=cmap(0.6), alpha=0.8, edgecolor='black', linewidth=0.3)
+
+            # Opcional: dibuixar fletxa d'orientació per alguns panells
+            if show_arrows and i % 15 == 0:
+                centroid = panel.centroid
+                arrow_len = min(self.panel_w, self.panel_l) * 0.6
+                ax.arrow(
+                    centroid.x, centroid.y,
+                    arrow_len * np.cos(np.radians(self.azimuth)),
+                    arrow_len * np.sin(np.radians(self.azimuth)),
+                    head_width=0.2, head_length=0.2, fc='red', ec='red'
+                )
+
+        # ❌ Dibuixar els punts d’inici (debug visual)
+        if show_start_points:
+            start_points = self._get_edge_start_points()
+            if start_points:
+                x, y = zip(*start_points)
+                ax.scatter(x, y, color='orange', s=50, marker='x', label='Punts inici')
+
+        # 📋 Llegenda i títol
+        ax.set_title(f"Optimització de Panells — Cluster {self.cluster.id}\n"
+                    f"Azimut: {self.azimuth:.1f}°  |  Tilt: {self.tilt:.1f}°  |  Panells: {len(panels)}",
+                    fontsize=14)
+
+        cluster_patch = mpatches.Patch(color='lightblue', label='Cluster')
+        panel_patch = mpatches.Patch(color=cmap(0.6), label='Panells solars')
+        ax.legend(handles=[cluster_patch, panel_patch])
+
+        # 🧭 Format del gràfic
+        ax.set_aspect('equal')
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.grid(True, linestyle='--', alpha=0.3)
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.05)  # Evita tallar parts del gràfic
+        plt.show()
+
+    def plot_edge_start_points(self):
+        points = self._get_edge_start_points()
+
+        # --- Dibuixar geometria del cluster ---
+        fig, ax = plt.subplots(figsize=(6,6))
+        if self.geometry.geom_type == "Polygon":
+            x, y = self.geometry.exterior.xy
+            ax.plot(x, y, color="black")
+            for interior in self.geometry.interiors:
+                xi, yi = interior.xy
+                ax.plot(xi, yi, color="red", linestyle="--")
+        elif self.geometry.geom_type == "MultiPolygon":
+            for poly in self.geometry.geoms:
+                x, y = poly.exterior.xy
+                ax.plot(x, y, color="black")
+                for interior in poly.interiors:
+                    xi, yi = interior.xy
+                    ax.plot(xi, yi, color="red", linestyle="--")
+
+        # --- Dibuixar punts d'inici ---
+        px = [p[0] for p in points]
+        py = [p[1] for p in points]
+        ax.scatter(px, py, color="blue", s=40, label="Start points")
+
+        ax.set_aspect("equal", "box")
+        ax.legend()
+        plt.show()
+
+
+class PanelPointAssociator:
+    """ Aquest programa l'entenc com un preparador del seguent, es podria dir que es com un clster2.0 per altre tipus d'informació
+        Genera els calculs per interconectar les plaques colocades i els punts del perfil de sombras
+        Que fa:
+            -Classifica el spunts en funció de si estan dintre, al borde o aprop de la placa amb un sistema de pesos
+            -Despres associa els pessos a uns punts per un panel_id concret
+            -Retorna els punts per un panel_id concret
+
+    """
+    def __init__(self, cluster, solar_panels, border_distance=0.5, near_distance=1.0,
+                 inner_weight=1.0, border_weight=0.8, near_weight=0.3):
+        self.cluster = cluster
+        self.solar_panels = solar_panels
+        self.border_distance = border_distance
+        self.near_distance = near_distance
+        self.inner_weight = inner_weight
+        self.border_weight = border_weight
+        self.near_weight = near_weight
+
+        self.points = np.array([[p['x'], p['y']] for p in cluster.points])
+        self.kdtree = KDTree(self.points)
+
+        # Llista: un DataFrame per cada panell amb tots els punts associats
+        self.panel_point_details = []
+
+        self._associate_and_weight()
+
+    def _classify_and_weight(self, point, panel):
+        p = Point(point)
+        if panel.contains(p):
+            return "inside", self.inner_weight
+        if panel.buffer(self.border_distance).contains(p):
+            dist = p.distance(panel.boundary)
+            w = self.inner_weight - (self.inner_weight - self.border_weight) * (dist / self.border_distance)
+            return "border", max(self.border_weight, w)
+        if panel.buffer(self.near_distance).contains(p):
+            dist = p.distance(panel.buffer(self.border_distance).boundary)
+            max_dist = self.near_distance - self.border_distance
+            w = self.border_weight - (self.border_weight - self.near_weight) * (dist / max_dist)
+            return "near", max(self.near_weight, w)
+        return None, 0.0
+
+    def _associate_and_weight(self):
+        for panel_id, panel in enumerate(self.solar_panels):
+            center = [panel.centroid.x, panel.centroid.y]
+            radius = max(panel.bounds[2] - panel.bounds[0],
+                         panel.bounds[3] - panel.bounds[1]) / 2 + self.near_distance
+            nearby_idxs = self.kdtree.query_ball_point(center, radius)
+
+            records = []
+            for idx in nearby_idxs:
+                point = self.points[idx]
+                category, weight = self._classify_and_weight(point, panel)
+                if category:
+                    p = self.cluster.points[idx]
+                    records.append({
+                        'panel_id': panel_id,
+                        'point_id': idx,
+                        'x': p['x'],
+                        'y': p['y'],
+                        'z': p['z'],
+                        'category': category,
+                        'weight': weight,
+                        'shading': p.get('shading', None)
+                    })
+            df = pd.DataFrame(records)
+            self.panel_point_details.append(df)
+
+    def get_panel_points(self, panel_id):
+        """
+        Retorna el DataFrame amb tots els punts associats al panell indicat.
+        """
+        if 0 <= panel_id < len(self.panel_point_details):
+            return self.panel_point_details[panel_id]
+        else:
+            raise IndexError(f"Panel_id {panel_id} fora de rang.")
+
+
+class TiltOptimizer:
+    def __init__(self, cluster, panel_point_details):
+        """
+        Inicializa el optimizador.
+        """
+        self.cluster = cluster
+        self.panel_point_details = panel_point_details
+        
+
+    def compute_optimal_orientation(self):
+      
+        tilt = getattr(self.cluster, 'tilt', 0)
+        if tilt < 5:   #tilt menor a 5
+            print("[INFO] Tilt < 45. Calcular media independiente por panel.")
+            return self.calculo_total_flat()
+        else:
+            print(f"[INFO] Tilt = {tilt}. Calcular media global para toda la cubierta.")
+            resultados = {panel_id: tilt for panel_id in range(len(self.panel_point_details))}
+            resultados["media_valida"] = tilt
+            return resultados
+
+
+    def _comprovar_invierno(self, punto: dict) -> bool:
+        """
+        Versión mejorada con verificación de datos y logging
+        """
+        # 1. Verificar que tenemos datos de sombra
+        if 'shading' not in punto or len(punto['shading']) != 360:
+            print("[ERROR] Punto no tiene perfil de sombra válido")
+            return False
+        
+        azimut = int(round(self.cluster.azimuth)) % 360
+        shading_profile = np.array(punto['shading'])
+        
+        # 2. Definir ventana más amplia para mayor robustez
+        ventana_size = 15  # ±15 grados
+        ventana = [(azimut + i) % 360 for i in range(-ventana_size, ventana_size + 1)]
+        
+        # 3. Calcular elevación solar en invierno (más preciso)
+        def get_solar_elevations(date):
+            times = pd.date_range(f"{date} 06:00", f"{date} 18:00", freq='10min', tz=cluster.time_zone)
+            solpos = solarposition.get_solarposition(times, self.cluster.lat, self.cluster.lon)
+            # Para cada ángulo en la ventana, encontrar la elevación máxima
+            elevaciones = []
+            for angle in ventana:
+                idx = (solpos['azimuth'] - angle).abs().idxmin()
+                elevaciones.append(solpos.loc[idx, 'elevation'])
+            return np.max(elevaciones)
+        
+        elev_invierno = get_solar_elevations("2024-12-21")
+        #print(f"[DEBUG] Elevación máxima en invierno: {elev_invierno:.1f}°")
+        
+        # 4. Analizar sombras en la ventana
+        sombras = shading_profile[ventana]
+        sombra_count = np.sum(sombras > elev_invierno)
+        total_puntos = len(ventana)
+       
+        # 5. Decisión basada en mayoría despejada (60%)
+        return sombra_count <= total_puntos * 0.6
+    
+    def _compute_roof_single(self, df, panel_id):
+        
+        azimut = int(round(self.cluster.azimuth)) % 360
+        algun_falso = False
+
+        for _, punto_row in df.iterrows():
+            punto = {
+                'shading': punto_row['shading']
+            }
+
+            if not self._comprovar_invierno(punto):
+                algun_falso = True
+
+        if algun_falso:
+            # Verano (ajustable: fórmula para verano)
+            lat = self.cluster.lat
+            tilt = max(lat * 0.93 - 21, 0)  # aqui haremos cambios
+            
+        else:
+            # Fijo para todo el año
+            lat = self.cluster.lat
+            if lat < 25:
+                tilt = lat * 0.87
+            elif 25 <= lat <= 50:
+                tilt = lat * 0.76 + 3.1
+            else:
+                tilt = lat  # para >50, aproximado
+            
+
+        
+        df_inside_border = df[df['category'].isin(['inside', 'border'])]
+        if df_inside_border.empty:
+            return "NO ÚTIL"
+        
+                        # Definimos una ventana de ±5 grados para el azimut
+        delta = 5
+        ventana = [(azimut + i) % 360 for i in range(-delta, delta + 1)]
+
+        sombras_inside_border = []
+
+        for _, row in df_inside_border.iterrows():
+            shading_profile = list(row['shading'])
+            sombras_en_ventana = [shading_profile[a] for a in ventana]
+            sombra_media = np.mean(sombras_en_ventana)
+            sombras_inside_border.append(sombra_media)
+
+        sombra_maxima = max(sombras_inside_border)
+
+        
+
+        if sombra_maxima > 50:
+            print(f"[DESCARTADO] Panel {panel_id}: sombra máxima > 45°, NO ÚTIL.")
+            return "NO ÚTIL"
+        else:
+            print(f"[RESULTADO] Panel {panel_id}: tilt recomendado final: {tilt:.1f}°")
+            return tilt
+
+    def calculo_total_flat(self):
+       
+        resultados = {}
+        tilts_validos = []
+
+        for panel_id, df in enumerate(self.panel_point_details):
+            if df.empty:
+                continue
+
+            flat_resultado = self._compute_roof_single(df, panel_id)
+
+            resultados[panel_id] = flat_resultado
+
+            if isinstance(flat_resultado, (int, float)):
+                tilts_validos.append(flat_resultado)
+
+        if tilts_validos:
+            media = np.mean(tilts_validos)
+            print(f"\n✅ Tilt medio recomendado para placas válidas: {media:.1f}°")
+            resultados["media_valida"] = media
+        else:
+            print("\n⚠️ Ninguna placa resultó útil.")
+            resultados["media_valida"] = None
+
+        return resultados
+
+
+def plot_tilt_results(cluster_geometry, solar_panels, tilt_results):
+ 
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_aspect('equal')
+    plt.title("Paneles y su inclinación recomendada")
+
+    # 📐 Dibuja la geometría del cluster al fondo
+    if isinstance(cluster_geometry, Polygon):
+        x, y = cluster_geometry.exterior.xy
+        ax.fill(x, y, alpha=0.3, color='lightblue', label='Cluster')
+    else:  # MultiPolygon
+        for poly in cluster_geometry.geoms:
+            x, y = poly.exterior.xy
+            ax.fill(x, y, alpha=0.3, color='lightblue', label='Cluster')
+
+    # 📐 Dibuja los paneles uno a uno
+    for panel_id, panel_geom in enumerate(solar_panels):
+        result = tilt_results.get(panel_id, "NO ÚTIL")
+        if result == "NO ÚTIL":
+            color = "red"
+            label = "No útil"
+        elif isinstance(result, (int, float)):
+            if result > 45:
+                color = "red"
+                label = "No útil"
+            else:
+                color = "green"
+                label = f"{result:.1f}°"
+        else:
+            color = "gray"
+            label = "Desconocido"
+
+        if isinstance(panel_geom, Polygon):
+            x, y = panel_geom.exterior.xy
+            ax.fill(x, y, alpha=0.6, color=color)
+            centroid = panel_geom.centroid
+            ax.text(centroid.x, centroid.y, label,
+                    ha='center', va='center', fontsize=7)
+
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.legend(loc='upper right')
+    plt.show()
+
+
+
+
+
+    # Ejemplo de uso integrado
+
+
+class PVlibSimulator:
+    def __init__(self, cluster, tilt_dict, panel_point_details,
+                 test_mode=False, n_test_hours=120,
+                 module_name='LG_Electronics_Inc__LG405N2W_A5',
+                 inverter_name='SunPower__SPR_4000m__240V_',
+                 temp_model='close_mount_glass_glass'):
+
+        self.cluster = cluster
+        self.tilt_dict = tilt_dict
+        self.panel_point_details = panel_point_details
+        self.test_mode = test_mode
+        self.n_test_hours = n_test_hours
+        self.debug = True
+
+        # 📍 Ubicación con TZ correcta
+        self.location = location.Location(
+            latitude=cluster.lat,
+            longitude=cluster.lon,
+            tz= cluster.time_zone,
+            altitude=getattr(cluster, "altitude", 100)
+        )
+
+        # 🌤 Cargar datos meteorológicos reales desde PVGIS
+        print("[INFO] Descargando TMY de PVGIS...")
+        self.weather, *_ = iotools.get_pvgis_tmy(cluster.lat, cluster.lon)
+
+        # Asegurar zona horaria
+        if self.weather.index.tz is None:
+            self.weather = self.weather.tz_localize('UTC').tz_convert(self.location.tz)
+        else:
+            self.weather = self.weather.tz_convert(self.location.tz)
+
+        # Recorte para modo test
+        if self.test_mode:
+            self.weather = self.weather.head(self.n_test_hours)
+
+        # ⚙️ Componentes del sistema
+        cec_modules = pvsystem.retrieve_sam('CECMod')           # ✅ no SandiaMod
+        cec_inverters = pvsystem.retrieve_sam('CECInverter')    # ✅ dataset correcto
+
+        self.module = cec_modules['Sunpower_SPR_X20_450_COM']                  # usa el nombre que ya tienes
+        self.inverter = cec_inverters['SunPower__SPR_4000m__240V_']
+        self.temp_params = TEMPERATURE_MODEL_PARAMETERS['sapm'][temp_model]
+  
+    def _col_name(self, df, names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    def simulate_panel_optimized(self, panel_id, time_resolution=None, return_modelchain=False):
+        if time_resolution is None:
+            time_resolution = f'{self.cluster.simulation_time}min' 
+        tilt = self.tilt_dict.get(panel_id)
+        if tilt == "NO ÚTIL" or not isinstance(tilt, (int, float)):
+            return None
+
+        # 📌 Seleccionar punto representativo para este panel
+        panel_points_df = self.panel_point_details[panel_id]
+        if not panel_points_df.empty:
+            for category in ['inside', 'border', 'near']:
+                rep_point = panel_points_df[panel_points_df['category'] == category]
+                if not rep_point.empty:
+                    punto = rep_point.loc[rep_point['weight'].idxmax()].to_dict()
+                    break
+            else:
+                print(f"[WARN] Panel {panel_id} no tiene puntos válidos")
+                return None
+        else:
+            print(f"[ERROR] No hay datos de puntos para el panel {panel_id}")
+            return None
+        print(f"[DEBUG] Panel {panel_id}: usando punto {punto.get('point_id')} con sombra hash {hash(tuple(punto['shading']))}")
+
+
+
+        # 🌓 Perfil de sombras
+        shading_profile = np.array(punto['shading'], dtype=float)
+        if shading_profile.size != 360:
+            shading_profile = np.pad(shading_profile, (0, 360 - shading_profile.size), 'constant')[:360]
+
+        print(f"Panel {panel_id} usando punto {punto.get('point_id', 'N/A')} "
+            f"(Cat: {punto['category']}, Peso: {punto['weight']:.2f})")
+
+        # ⏱ Preparar datos meteorológicos reales
+        if time_resolution != '1min':
+            weather_data = self.weather.resample(time_resolution).interpolate(method='time').asfreq(time_resolution)
+        else:
+            weather_data = self.weather.copy()
+
+        # 📋 Nombres de columnas
+        col_ghi = self._col_name(weather_data, ['ghi', 'G(h)', 'GHI']) or 'ghi'
+        col_dni = self._col_name(weather_data, ['dni', 'Gb(n)', 'DNI']) or 'dni'
+        col_dhi = self._col_name(weather_data, ['dhi', 'Gd(h)', 'DHI']) or 'dhi'
+        col_temp = self._col_name(weather_data, ['temp_air', 'temp', 'air_temperature', 'TA']) or 'temp_air'
+        col_wind = self._col_name(weather_data, ['wind_speed', 'wind', 'WS']) or 'wind_speed'
+
+        for col, default in [(col_ghi, 0.0), (col_dni, 0.0), (col_dhi, 0.0),
+                            (col_temp, 20.0), (col_wind, 1.0)]:
+            if col not in weather_data:
+                weather_data[col] = default
+
+        def svf_from_shading_profile(shading_profile_deg):
+            """Calcula SVF (sky view factor) a partir d'un perfil d'horitzó de 360 valors (graus)."""
+            h = np.radians(np.asarray(shading_profile, dtype=float))
+            return float(np.clip(np.mean(np.cos(h)**2), 0.0, 1.0))
+
+
+
+
+        # 🌞 Calcular posiciones solares
+        solpos = pvlib.solarposition.get_solarposition(
+            time=weather_data.index,
+            latitude=self.cluster.lat,
+            longitude=self.cluster.lon
+        )
+
+        # calcula SVF una sola vegada
+        SVF = svf_from_shading_profile(shading_profile)
+
+        if int(time_resolution.replace('min','')) <= 10:
+            # --- Caso resoluciones finas (≤10min): exacto por instante ---
+           
+            solar_elevation = solpos['elevation'].values
+            solar_azimuth = np.mod(np.round(solpos['azimuth']).astype(int), 360)
+            shading_angles = shading_profile[solar_azimuth]
+            unshaded = solar_elevation > shading_angles
+            shaded_mask = ~unshaded
+
+            weather_mod = weather_data.copy()
+            weather_mod[col_dni] = np.where(shaded_mask, 0.0, weather_mod[col_dni])
+
+            # separació difusa en circumsolar i isotropa
+            ai = (weather_data[col_dni] / (weather_data[col_dni] + 3.0 * weather_data[col_dhi])).clip(0, 1)
+            dhi_circ = ai * weather_data[col_dhi]
+            dhi_iso  = (1 - ai) * weather_data[col_dhi]
+
+            # aplica ombres
+            dhi_circ_adj = np.where(shaded_mask, 0.0, dhi_circ)              # circumsolar bloquejat si hi ha obstacle
+            dhi_iso_adj  = np.where(shaded_mask, dhi_iso * SVF, dhi_iso)     # isotropa reduïda pel SVF
+
+            weather_mod[col_dhi] = dhi_circ_adj + dhi_iso_adj
+          
+            # recalcula GHI
+            cos_theta_z = np.cos(np.radians(solpos['zenith']))
+            ghi_new = weather_mod[col_dhi] + weather_mod[col_dni] * np.maximum(cos_theta_z, 0)
+            weather_mod[col_ghi] = ghi_new
+
+        else:
+            # --- Caso resoluciones >10min: fracción de sombra por bloque ---
+            elev_blk = solpos['elevation'].resample(time_resolution)
+            azim_blk = solpos['azimuth'].resample(time_resolution)
+
+            def shaded_fraction_from_block(block_elev, block_azim, shading_profile_deg):
+                if block_elev.empty:
+                    return 0.0
+                az = np.mod(np.round(block_azim.values).astype(int), 360)
+                el = block_elev.values
+                counts = np.bincount(az, minlength=360).astype(float)
+                total = counts.sum()
+                if total == 0:
+                    return 0.0
+                sum_elev = np.bincount(az, weights=el, minlength=360)
+                mean_elev = np.divide(sum_elev, counts, out=np.zeros_like(sum_elev), where=counts > 0)
+                shaded_by_bin = (mean_elev <= shading_profile_deg)
+                frac = (counts * shaded_by_bin).sum() / total
+                return float(frac)
+
+            shading_profile_arr = np.asarray(shading_profile, dtype=float)
+
+            shaded_fraction = []
+            for (t_start, elev_series), (_, azim_series) in zip(elev_blk, azim_blk):
+                frac = shaded_fraction_from_block(elev_series, azim_series, shading_profile_arr)
+                shaded_fraction.append((t_start, frac))
+
+            shaded_fraction = pd.Series(
+                data=[v for _, v in shaded_fraction],
+                index=[i for i, _ in shaded_fraction]
+            )
+
+            weather_blk = weather_data.resample(time_resolution).mean()
+
+            # DNI → reduït per la fracció d’ombra
+            dni_blk = weather_blk[col_dni] * (1.0 - shaded_fraction)
+
+            # separació difusa en circumsolar i isotropa
+            ai_blk = (weather_blk[col_dni] / (weather_blk[col_dni] + 3.0 * weather_blk[col_dhi])).clip(0, 1)
+            dhi_circ_blk = ai_blk * weather_blk[col_dhi]
+            dhi_iso_blk  = (1 - ai_blk) * weather_blk[col_dhi]
+
+            # aplica ombres
+            dhi_circ_adj_blk = dhi_circ_blk * (1.0 - shaded_fraction)   # circumsolar atenuat com DNI
+            dhi_iso_adj_blk  = dhi_iso_blk * ((1.0 - shaded_fraction) + shaded_fraction * SVF)
+
+            dhi_blk = dhi_circ_adj_blk + dhi_iso_adj_blk
+
+            # recalcula GHI per bloc
+            zenith_blk = solpos['zenith'].resample(time_resolution).mean()
+            cos_theta_z_blk = np.cos(np.radians(zenith_blk))
+            ghi_blk = dhi_blk + dni_blk * np.maximum(cos_theta_z_blk, 0)
+
+            weather_mod = weather_blk.copy()
+            weather_mod[col_dni] = dni_blk
+            weather_mod[col_dhi] = dhi_blk
+            weather_mod[col_ghi] = ghi_blk
+
+        # 📊 Totals mensuales
+        monthly = weather_mod[[col_dni, col_ghi, col_dhi]].resample('ME').sum()
+
+
+
+        # 🔌 Crear sistema PV
+        system = PVSystem(
+            surface_tilt=tilt,
+            surface_azimuth=self.cluster.azimuth,
+            module_parameters=self.module,
+            inverter_parameters=self.inverter,
+            temperature_model_parameters=self.temp_params
+        )
+     
+
+        mc = ModelChain(
+            system,
+            self.location,
+            aoi_model='physical',
+            spectral_model='no_loss',
+            temperature_model='sapm'
+        )
+
+       
+        try:
+            #revisio
+            weather_for_mc = pd.DataFrame(index=weather_mod.index)
+            weather_for_mc['dni']        = weather_mod[col_dni].astype(float)
+            weather_for_mc['ghi']        = weather_mod[col_ghi].astype(float)
+            weather_for_mc['dhi']        = weather_mod[col_dhi].astype(float)
+            weather_for_mc['temp_air']   = weather_mod[col_temp].astype(float)
+            weather_for_mc['wind_speed'] = weather_mod[col_wind].astype(float)
+
+            # Opcional: garantiza no-negativos
+            for c in ['dni','ghi','dhi']:
+                weather_for_mc[c] = weather_for_mc[c].clip(lower=0)
+        
+            mc.run_model(weather_mod)
+            ac = mc.results.ac  # W
+
+            poa_global = mc.results.total_irrad['poa_global']  # W/m²
+            ac = ac.clip(lower=0.0)
+            if len(ac) < 2:
+                dt_h = 1.0
+            else:
+                dt_h = (ac.index[1] - ac.index[0]).total_seconds() / 3600.0
+
+            panel_area_m2 = 1.7  # set your real panel area here
+
+            # --- energy per timestep (kWh) for the panel (total kWh per panel) ---
+            energy_step_kwh = ac * dt_h / 1000.0           # Series indexed like ac, units kWh (per step) for the whole panel
+            energy_monthly_kwh = energy_step_kwh.groupby(energy_step_kwh.index.month).sum().reindex(range(1,13), fill_value=0.0)
+            energy_monthly_kwh_m2 = energy_monthly_kwh / panel_area_m2
+
+
+            # --- POA: energy per timestep (kWh/m²) ---
+            poa_step_kwh_m2 = poa_global * dt_h / 1000.0
+            poa_monthly_kwh_m2 = poa_step_kwh_m2.groupby(poa_step_kwh_m2.index.month).sum().reindex(range(1,13), fill_value=0.0)
+            
+            # Build monthly dicts for CSV
+            monthly_panel_dict = {f"energy_kwh_month_{str(m).zfill(2)}": round(v, 3)
+                                for m, v in enumerate(energy_monthly_kwh.values, start=1)}
+            monthly_panel_m2_dict = {f"energy_kwh_m2_month_{str(m).zfill(2)}": round(v, 3)
+                                    for m, v in enumerate(energy_monthly_kwh_m2.values, start=1)}
+            monthly_poa_dict = {f"poa_kwh_m2_month_{str(m).zfill(2)}": round(v, 3)
+                                for m, v in enumerate(poa_monthly_kwh_m2.values, start=1)}
+
+            # Totals
+            total_energy_kwh = energy_monthly_kwh.sum()
+            total_energy_kwh_m2 = energy_monthly_kwh_m2.sum()
+
+
+
+
+            #Per plot final
+            if not hasattr(self, 'panel_energy_results'):
+                self.panel_energy_results = {}
+            
+            # Store just the essential yearly energy data
+            self.panel_energy_results[panel_id] = {
+                'yearly_energy_kwh': float(total_energy_kwh),
+                'yearly_energy_kwh_m2': float(total_energy_kwh_m2),
+                'tilt': tilt,
+                'point_id': punto.get('point_id')
+            }
+
+            # Store key results as instance attributes for later access
+            self.ac = ac
+            self.poa_global = poa_global
+            self.dt_h = dt_h
+            self.panel_area_m2 = panel_area_m2
+            self.energy_monthly_kwh = energy_monthly_kwh
+            self.energy_monthly_kwh_m2 = energy_monthly_kwh_m2
+            self.poa_monthly_kwh_m2 = poa_monthly_kwh_m2
+            self.panel_id = panel_id
+            self.col_ghi = col_ghi
+            self.col_dni = col_dni
+            self.col_dhi = col_dhi
+            self.monthly = monthly
+            self.monthly_panel_dict = monthly_panel_dict
+            
+
+            # Compose result dict (example)
+            result = {
+                "panel_id": panel_id,
+                "tilt_deg": tilt,
+                "max_power_w": float(ac.max()),
+                "mean_power_w": float(ac.mean()),
+                "total_energy_kwh": float(total_energy_kwh),
+                #"total_energy_kwh_m2": float(total_energy_kwh_m2),
+                "point_id": punto.get('point_id'),
+                "point_category": punto['category'],
+                #"point_weight": float(punto['weight']),
+                **monthly_panel_dict,
+                #**monthly_panel_m2_dict,
+                **monthly_poa_dict
+            }
+            return (mc, result) if return_modelchain else result
+
+        except Exception as e:
+            print(f"[ERROR] simulando panel {panel_id}: {str(e)}")
+            return None
+
+    def compute_and_save_csv(self, filename="results.csv", workers=4):
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Selección de paneles con tilt válido
+        panel_ids = [i for i in range(len(self.panel_point_details))
+                    if isinstance(self.tilt_dict.get(i), (int, float))]
+
+        results = []
+
+        # Ejecución paralela segura con ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self.simulate_panel_optimized, pid): pid for pid in panel_ids}
+            for fut in futures:
+                res = fut.result()
+                if res:
+                    results.append(res)
+
+        if results:
+            df = pd.DataFrame(results).sort_values("panel_id")
+            df.to_csv(filename, index=False)
+            print(f"✅ Saved results to {filename}")
+            print(df.describe())
+            return df
+        else:
+            print("⚠️ No valid results to save")
+            return None
+    
+    def plot_panel_power_and_horizon(self, panel_id, fecha='2024-06-21', window_minutes=5):
+        """
+        Muestra:
+        1) Potencia generada vs. periodos de sombra en el día indicado
+        2) Perfil de sombras + trayectoria solar del mismo día
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+        import numpy as np
+        import pandas as pd
+        import ast
+
+        try:
+            # 1) Simular el panel para obtener mc y punto representativo
+            sim_res = self.simulate_panel_optimized(panel_id, return_modelchain=True)
+            if not sim_res:
+                print(f"[ERROR] No se pudo simular el panel {panel_id}")
+                return
+            mc, summary = sim_res
+
+            panel_df = self.panel_point_details[panel_id]
+
+            # Buscar punto representativo del resultado
+            if 'point_id' in summary:
+                mask = panel_df['point_id'] == summary['point_id']
+                if mask.any():
+                    punto = panel_df[mask].iloc[0]
+                else:
+                    punto = panel_df.iloc[0]
+            else:
+                for cat in ['inside', 'border', 'near']:
+                    subset = panel_df[panel_df['category'] == cat]
+                    if not subset.empty:
+                        punto = subset.iloc[0]
+                        break
+
+            # 2) Obtener perfil de sombras
+            shading_raw = punto['shading']
+            if isinstance(shading_raw, str):
+                try:
+                    shading_profile = np.array(ast.literal_eval(shading_raw), dtype=float)
+                except Exception:
+                    shading_profile = np.array([float(x) for x in shading_raw.split(',') if x.strip()], dtype=float)
+            else:
+                shading_profile = np.array(shading_raw, dtype=float)
+
+            if shading_profile.size < 360:
+                shading_profile = np.pad(shading_profile, (0, 360 - shading_profile.size), 'constant', constant_values=0)
+            elif shading_profile.size > 360:
+                shading_profile = shading_profile[:360]
+
+            # 3) Datos de potencia para el día
+            ac = mc.results.ac
+            target_date = pd.to_datetime(fecha).date()
+            mask_day = ac.index.date == target_date
+            day_power = ac[mask_day]
+            if day_power.empty:
+                print(f"[WARN] No hay datos para la fecha {fecha}")
+                return
+
+            solpos_day = pvlib.solarposition.get_solarposition(day_power.index, self.cluster.lat, self.cluster.lon)
+            azs = np.mod(np.round(solpos_day['azimuth']).astype(int), 360)
+            elevs = solpos_day['elevation'].values
+
+            # 4) Trayectoria solar para gráfico inferior
+            times_day = pd.date_range(fecha + ' 06:00', fecha + ' 21:00', freq='10min', tz=self.location.tz)
+            solpos_traj = pvlib.solarposition.get_solarposition(times_day, self.cluster.lat, self.cluster.lon)
+            az_traj = np.mod(np.round(solpos_traj['azimuth']).astype(int), 360)
+            el_traj = solpos_traj['elevation'].values
+
+            # 5) Graficar
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), gridspec_kw={'height_ratios': [2, 1]})
+
+            # --- Arriba: Potencia y sombra ---
+            ax1.plot(day_power.index, day_power.values, color='green', lw=2, label='Potencia generada')
+            for t, az, el in zip(day_power.index, azs, elevs):
+                if el > 0 and el <= shading_profile[az]:
+                    ax1.axvspan(t - pd.Timedelta(minutes=window_minutes),
+                                t + pd.Timedelta(minutes=window_minutes),
+                                color='red', alpha=0.3)
+            ax1.set_ylabel('Potencia AC (W)')
+            ax1.set_title(f'Panel {panel_id} — Potencia y periodos sombreados ({fecha})')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(handles=[
+                Patch(facecolor='green', label='Potencia generada'),
+                Patch(facecolor='red', alpha=0.3, label='Sombra')
+            ])
+
+            # --- Abajo: Horizonte y trayectoria ---
+            angulos = np.arange(0, 360)
+            ax2.plot(angulos, shading_profile, color='darkred', lw=2, label='Perfil de sombras')
+            ax2.plot(az_traj, el_traj, color='gold', label='Sol del día')
+            ax2.set_xlim(0, 360)
+            ax2.set_ylim(0, 90)
+            ax2.set_xticks(np.arange(0, 361, 45))
+            ax2.set_xticklabels(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'])
+            ax2.set_xlabel('Azimut (°)')
+            ax2.set_ylabel('Elevación (°)')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"[ERROR] plot_panel_power_and_horizon: {e}")
+
+    def info_important(self):
+        # Verificar que se hayan calculado resultados
+        required_attrs = ['ac', 'poa_global', 'dt_h', 'panel_area_m2',
+                        'energy_monthly_kwh', 'energy_monthly_kwh_m2', 
+                        'poa_monthly_kwh_m2', 'monthly', 'col_ghi', 'col_dhi', 'col_dni']
+        
+        missing = [attr for attr in required_attrs if not hasattr(self, attr)]
+        if missing:
+            print(f"[WARN] No se han simulado paneles todavía. Faltan atributos: {missing}")
+            return
+
+        # Calcular energías
+        poa_energy_kwh_m2 = self.poa_global.sum() * self.dt_h / 1000.0
+        ac_energy_kwh_m2 = self.ac.sum() * self.dt_h / 1000.0 / self.panel_area_m2
+
+        efficiency_estimate = ac_energy_kwh_m2 / poa_energy_kwh_m2 if poa_energy_kwh_m2 > 0 else 0
+
+        print(f"Estimated system efficiency: {efficiency_estimate * 100:.2f}%")
+        print(f"Average monthly panel energy (kWh): {self.energy_monthly_kwh.values.mean():.2f}")
+        print(f"Average monthly AC energy per m² (kWh/m²): {self.energy_monthly_kwh_m2.values.mean():.2f}")
+        print(f"Average monthly POA irradiance energy (kWh/m²): {self.poa_monthly_kwh_m2.values.mean():.2f}")
+        print(f"Ghi energy (kWh/m²): {self.monthly[self.col_ghi].sum() * self.dt_h / 1000.0:.2f}")
+        print(f"Dhi energy (kWh/m²): {self.monthly[self.col_dhi].sum() * self.dt_h / 1000.0:.2f}")
+        print(f"Dni energy (kWh/m²): {self.monthly[self.col_dni].sum() * self.dt_h / 1000.0:.2f}")
+
+
+    def _get_poa_samples(self, cluster=None, solpos=None, max_points=None):
+        """
+        Optimized version that works with any cluster
+        """
+        from scipy.spatial import cKDTree
+        target_cluster = cluster if cluster else self.cluster
+        all_points = target_cluster.points
+        
+        # Efficient sampling if many points
+        if max_points and len(all_points) > max_points:
+            coords = np.array([[p['x'], p['y']] for p in all_points])
+            tree = cKDTree(coords)
+            
+            if max_points <= 1000:
+                indices = np.random.choice(len(coords), max_points, replace=False)
+            else:
+                _, indices = tree.query(tree.data, k=1, workers=-1)
+                indices = np.unique(indices)[:max_points]
+            
+            sample_points = [all_points[i] for i in indices]
+        else:
+            sample_points = all_points
+
+        # Calculate solar position if not provided
+        if solpos is None:
+            solpos = pvlib.solarposition.get_solarposition(
+                time=self.weather.index,
+                latitude=target_cluster.lat,
+                longitude=target_cluster.lon
+            )
+
+        # Process points
+        points = np.zeros((len(sample_points), 2))
+        values = np.zeros(len(sample_points))
+        valid_count = 0
+        
+        for i, point in enumerate(sample_points):
+            try:
+                shading = np.array(point['shading'], dtype=np.float32)
+                if shading.size != 360:
+                    shading = np.interp(np.linspace(0, 359, 360),
+                                     np.arange(shading.size),
+                                     shading)
+                
+                poa = self.calcular_poa_punt(
+                    x=point['x'],
+                    y=point['y'],
+                    shading_profile=shading,
+                    solpos=solpos,
+                    cluster=target_cluster
+                )
+                
+                if poa is not None:
+                    points[valid_count] = [point['x'], point['y']]
+                    values[valid_count] = poa
+                    valid_count += 1
+                    
+            except Exception as e:
+                print(f"Error in point {i}: {str(e)[:50]}...")
+                continue
+
+        return points[:valid_count], values[:valid_count]
+
+    def find_csv_for_cluster(self, building_path, cluster_id):
+        """Find CSV with proper path handling"""
+        # Go up one level from Plane Identification to building folder
+        building_root = os.path.dirname(os.path.dirname(building_path))
+        csv_dir = os.path.join(building_root, "Shading")
+        expected_csv = f"{cluster_id}.csv"
+        csv_path = os.path.normpath(os.path.join(csv_dir, expected_csv))
+
+        if os.path.exists(csv_path):
+            return csv_path
+        
+        # Try alternative names
+        for alt_name in [f"cluster_{cluster_id}.csv", f"Cluster{cluster_id}.csv"]:
+            alt_path = os.path.join(csv_dir, alt_name)
+            if os.path.exists(alt_path):
+                return alt_path
+                
+        raise FileNotFoundError(f"No CSV found for cluster {cluster_id} in {csv_dir}")
+
+    def calcular_poa_punt(self, x, y, shading_profile, solpos=None, cluster=None):
+        target_cluster = cluster if cluster else self.cluster
+
+        try:
+            if solpos is None:
+                solpos = pvlib.solarposition.get_solarposition(
+                    time=self.weather.index,
+                    latitude=target_cluster.lat,
+                    longitude=target_cluster.lon
+                )
+
+            solar_az = np.clip(np.mod(np.round(solpos['azimuth']).astype(int), 360), 0, 359)
+            shaded = solpos['elevation'] <= shading_profile[solar_az]
+
+            # Copiar datos meteorológicos
+            weather_mod = self.weather.copy()
+
+            # Aplicar sombra
+            weather_mod['dni'] = np.where(shaded, 0.0, weather_mod['dni'])
+
+            # Opción conservadora: quitar un % de difusa en sombra total
+            diff_factor = 0.6  # 50% de difusa en sombra
+            weather_mod['dhi'] = np.where(shaded, weather_mod['dhi'] * diff_factor, weather_mod['dhi'])
+
+            # Recalcular GHI con datos filtrados
+            cos_zenith = np.cos(np.radians(solpos['zenith']))
+            weather_mod['ghi'] = weather_mod['dhi'] + weather_mod['dni'] * np.maximum(cos_zenith, 0)
+
+            # Calcular POA
+            poa = pvlib.irradiance.get_total_irradiance(
+                surface_tilt=target_cluster.tilt,
+                surface_azimuth=target_cluster.azimuth,
+                solar_zenith=solpos['apparent_zenith'],
+                solar_azimuth=solpos['azimuth'],
+                dni=weather_mod['dni'],
+                ghi=weather_mod['ghi'],
+                dhi=weather_mod['dhi'],
+                albedo=0.2
+            )['poa_global']
+
+            # Integración a kWh/m²
+            dt_h = (self.weather.index[1] - self.weather.index[0]).total_seconds() / 3600
+            return poa.sum() * dt_h / 1000
+
+        except Exception as e:
+            print(f"Error calculating POA at ({x}, {y}): {e}")
+            return None
+    
+    def _plot_single_heatmap(self, ax, cluster, points, values):
+        """Plot a single heatmap on given axis"""
+        x_min, y_min, x_max, y_max = cluster.geometry.bounds
+        xi, yi = np.meshgrid(
+            np.linspace(x_min, x_max, 200),
+            np.linspace(y_min, y_max, 200)
+        )
+        rbf = Rbf(points[:,0], points[:,1], values, function='thin_plate')
+        zi = rbf(xi, yi)
+        
+        mask = np.array([[not cluster.geometry.contains(Point(x, y)) 
+                        for x, y in zip(xi.ravel(), yi.ravel())]]).reshape(xi.shape)
+        zi[mask] = np.nan
+
+        cmap = LinearSegmentedColormap.from_list('thermal', ['#1a2c8b', '#ffffff', '#a51700'])
+        contour = ax.contourf(xi, yi, zi, levels=20, cmap=cmap, alpha=0.9)
+        plt.colorbar(contour, ax=ax, label='POA Anual (kWh/m²)')
+
+        if isinstance(cluster.geometry, Polygon):
+            x, y = cluster.geometry.exterior.xy
+            ax.plot(x, y, 'k-', linewidth=0.5)
+        else:
+            for poly in cluster.geometry.geoms:
+                x, y = poly.exterior.xy
+                ax.plot(x, y, 'k-', linewidth=0.5)
+   
+    def plot_total_POA(self):
+        """Visualize all clusters together in one plot with consistent color scale"""
+        try:
+            gdf = gpd.read_file(self.cluster.gpkg_path)
+            cluster_ids = gdf['cluster'].unique() if 'cluster' in gdf.columns else [1]
+            
+            # Create single figure
+            fig, ax = plt.subplots(figsize=(14, 10))
+            
+            # Pre-calculate solar positions once
+            solpos = pvlib.solarposition.get_solarposition(
+                time=self.weather.index,
+                latitude=self.cluster.lat,
+                longitude=self.cluster.lon
+            )
+
+            # First pass: collect all POA values to determine global min/max
+            all_values = []
+            for cluster_id in cluster_ids:
+                try:
+                    csv_path = self.find_csv_for_cluster(self.cluster.gpkg_path, cluster_id)
+                    temp_cluster = Cluster(
+                        cluster_id=cluster_id,
+                        gpkg_path=self.cluster.gpkg_path,
+                        csv_path=csv_path,
+                        lat=self.cluster.lat,
+                        lon=self.cluster.lon,
+                        simulation_time=self.cluster.simulation_time,
+                        time_zone=self.cluster.time_zone
+                    )
+                    _, values = self._get_poa_samples(cluster=temp_cluster, solpos=solpos)
+                    all_values.extend(values)
+                except Exception as e:
+                    print(f"Error processing cluster {cluster_id}: {str(e)[:100]}")
+                    continue
+
+            if not all_values:
+                print("No valid POA values found")
+                return
+
+            # Determine global min/max for consistent color scaling
+            global_min = min(all_values)
+            global_max = max(all_values)
+            levels = np.linspace(global_min, global_max, 20)
+
+            # Second pass: actual plotting with consistent scale
+            for cluster_id in cluster_ids:
+                try:
+                    csv_path = self.find_csv_for_cluster(self.cluster.gpkg_path, cluster_id)
+                    temp_cluster = Cluster(
+                        cluster_id=cluster_id,
+                        gpkg_path=self.cluster.gpkg_path,
+                        csv_path=csv_path,
+                        lat=self.cluster.lat,
+                        lon=self.cluster.lon,
+                        simulation_time=self.cluster.simulation_time,
+                        time_zone=self.cluster.time_zone
+                    )
+                    points, values = self._get_poa_samples(cluster=temp_cluster, solpos=solpos)
+                    
+                    # Plot with consistent scale
+                    x_min, y_min, x_max, y_max = temp_cluster.geometry.bounds
+                    xi, yi = np.meshgrid(
+                        np.linspace(x_min, x_max, 200),
+                        np.linspace(y_min, y_max, 200)
+                    )
+                    rbf = Rbf(points[:,0], points[:,1], values, function='thin_plate')
+                    zi = rbf(xi, yi)
+                    
+                    mask = np.array([[not temp_cluster.geometry.contains(Point(x, y)) 
+                                    for x, y in zip(xi.ravel(), yi.ravel())]]).reshape(xi.shape)
+                    zi[mask] = np.nan
+
+                    cmap = LinearSegmentedColormap.from_list('thermal', ['#1a2c8b', '#ffffff', '#a51700'])
+                    contour = ax.contourf(xi, yi, zi, levels=levels, cmap=cmap, alpha=0.7)
+                    
+                    # Add cluster border
+                    if isinstance(temp_cluster.geometry, Polygon):
+                        x, y = temp_cluster.geometry.exterior.xy
+                        ax.plot(x, y, 'k-', linewidth=0.8)
+                    else:
+                        for poly in temp_cluster.geometry.geoms:
+                            x, y = poly.exterior.xy
+                            ax.plot(x, y, 'k-', linewidth=0.8)
+
+                except Exception as e:
+                    print(f"Error plotting cluster {cluster_id}: {str(e)[:100]}")
+                    continue
+
+            # Add single colorbar for all clusters
+            cbar = plt.colorbar(contour, ax=ax, label='POA Anual (kWh/m²)')
+            plt.title('All Clusters Combined - POA Radiation (Consistent Scale)')
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"Error processing GPKG: {str(e)}")
+            raise
+
+    def plot_incident_vs_produced(self):
+        """
+        Compara la radiació incident (POA) amb l'energia produïda pel clúster.
+        Mostra un gràfic de barres amb kWh/m² anuals.
+        """
+        import matplotlib.pyplot as plt
+
+        if not hasattr(self, 'poa_global') or not hasattr(self, 'ac'):
+            print("⚠️ Primer has de simular almenys un panell amb simulate_panel_optimized().")
+            return
+
+        # Radiació incident total (POA) [kWh/m²]
+        poa_energy_kwh_m2 = self.poa_global.sum() * self.dt_h / 1000.0
+
+        # Energia produïda total AC [kWh/m²] (considerant superfície de panell)
+        ac_energy_kwh_m2 = self.ac.sum() * self.dt_h / 1000.0 / self.panel_area_m2
+
+        # Eficiència global
+        efficiency = ac_energy_kwh_m2 / poa_energy_kwh_m2 * 100 if poa_energy_kwh_m2 > 0 else 0
+
+        # Plot
+        labels = ["Radiació incident (POA)", "Energia produïda (AC)"]
+        values = [poa_energy_kwh_m2, ac_energy_kwh_m2]
+        colors = ["orange", "green"]
+
+        plt.figure(figsize=(7, 6))
+        bars = plt.bar(labels, values, color=colors, alpha=0.8)
+        plt.ylabel("kWh/m² (anuals)")
+        plt.title("Comparació radiació incident vs. producció AC\n"
+                f"Eficiència global: {efficiency:.1f}%")
+
+        # Afegir valors damunt de les barres
+        for bar, val in zip(bars, values):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.01,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=10)
+
+        plt.grid(axis="y", linestyle="--", alpha=0.5)
+        plt.show()
+
+
+    def process_all_clusters(self, gpkg_path, lat, lon, simulation_time=10, time_zone="Europe/Madrid"):
+        
+
+        """Process all clusters in a building and return results without plotting"""
+        gdf = gpd.read_file(gpkg_path)
+        cluster_ids = gdf['cluster'].unique() if 'cluster' in gdf.columns else [1]
+
+        all_results = []
+        all_geometries = []
+
+        for cluster_id in cluster_ids:
+            try:
+                # 1) Load cluster data
+                csv_path = self.find_csv_for_cluster(gpkg_path, cluster_id)
+                cluster_obj = Cluster(cluster_id, gpkg_path, csv_path, lat, lon, simulation_time, time_zone)
+
+                # 2) Panel placement
+                optimizer = SolarPanelOptimizer(cluster_obj)
+                panels = optimizer.optimize_placement()
+
+                # 3) Point-panel association
+                associator = PanelPointAssociator(cluster_obj, panels)
+
+                # 4) Calculate tilts
+                tilt_opt = TiltOptimizer(cluster_obj, associator.panel_point_details)
+                tilt_results = tilt_opt.compute_optimal_orientation()
+
+                # 5) PVlib simulation
+                pvlib_sim = PVlibSimulator(cluster_obj, tilt_results, associator.panel_point_details)
+
+                for pid in range(len(panels)):
+                    res = pvlib_sim.simulate_panel_optimized(pid)
+                    if res:
+                        # Add required fields
+                        res["cluster_id"] = cluster_id
+                        res["geometry"] = panels[pid]
+                        res["energy_annual_kwh"] = res.get("total_energy_kwh", None)
+
+                        # Filter monthly fields
+                        monthly_fields = {
+                            k: v for k, v in res.items()
+                            if k.startswith("energy_kwh_month_")
+                        }
+
+                        # Sort by month
+                        monthly_fields = dict(sorted(
+                            monthly_fields.items(),
+                            key=lambda x: int(x[0].split('_')[-1])
+                        ))
+
+                        # Build final record
+                        record = {
+                            "panel_id": res.get("panel_id"),
+                            "cluster_id": cluster_id,
+                            "tilt_deg": res.get("tilt_deg", 0),
+                            "point_id": res.get("point_id", ""),
+                            "energy_annual_kwh": res.get("energy_annual_kwh"),
+                            **res.get("monthly_panel_dict", {}),
+                            **monthly_fields
+                        }
+                        record["geometry"] = res.get("geometry")
+                        all_results.append(record)
+
+                all_geometries.append(cluster_obj.geometry)
+
+            except Exception as e:
+                print(f"❌ Error processing cluster {cluster_id}: {str(e)[:100]}")
+                continue
+
+        if not all_results:
+            print("⚠️ No results generated.")
+            return None, None
+
+        return pd.DataFrame(all_results), all_geometries
+
+    def save_to_csv(self, df, gpkg_path):
+        """Save results to CSV file"""
+        if df is None:
+            print("⚠️ No data to save")
+            return
+
+        # Reorder columns: metadata first, then months
+        meta_cols = ["panel_id", "cluster_id", "tilt_deg", "point_id", "energy_annual_kwh"]
+        month_cols = sorted([c for c in df.columns if c.startswith("energy_kwh_month_")])
+        
+        df = df[meta_cols + month_cols]
+        
+        # Format numbers for Excel
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].apply(lambda x: str(x).replace('.', ',') if pd.notnull(x) else '')
+        
+        # Save with ; separator
+        building_id = os.path.basename(os.path.dirname(os.path.dirname(gpkg_path)))
+        csv_filename = f"Results_{building_id}.csv"
+        df.to_csv(csv_filename, sep=';', index=False)
+        print(f"✅ CSV saved for Excel: {csv_filename}")
+
+    def plot_results(self, df, geometries, use_m2=False):
+        """Plot the results"""
+        if df is None or not geometries:
+            print("⚠️ No data to plot")
+            return
+
+        energies = df["energy_annual_kwh"].dropna().tolist()
+        if not energies:
+            print("⚠️ No energy data to plot")
+            return
+
+        # Create colormap
+        norm = Normalize(vmin=min(energies), vmax=max(energies))
+        colors = [
+            (0, 0, 1),       # Blue
+            (0.5, 0, 0.5),   # Purple
+            (1, 0, 0),       # Red
+            (1, 1, 0)        # Yellow
+        ]
+        cmap = LinearSegmentedColormap.from_list('blue_purple_red_yellow', colors, N=256)
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(14, 10))
+        ax.set_aspect("equal")
+
+        # Plot clusters as background
+        for geom in geometries:
+            if isinstance(geom, Polygon):
+                x, y = geom.exterior.xy
+                ax.fill(x, y, alpha=0.3, color="lightblue")
+            else:
+                for poly in geom.geoms:
+                    x, y = poly.exterior.xy
+                    ax.fill(x, y, alpha=0.3, color="lightblue")
+
+        # Plot panels colored by energy
+        for _, row in df.iterrows():
+            energy_val = row["energy_annual_kwh"]
+            geom = row["geometry"]
+            if pd.notna(energy_val) and isinstance(geom, Polygon):
+                color = cmap(norm(energy_val))
+                x, y = geom.exterior.xy
+                ax.fill(x, y, alpha=0.8, color=color)
+
+        # Add colorbar
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        label = "Annual energy (kWh/m²)" if use_m2 else "Annual energy (kWh)"
+        plt.colorbar(sm, ax=ax, label=label)
+
+        plt.title("Annual energy production - All panels")
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.grid(True, linestyle="--", alpha=0.3)
+        plt.show()
+
+    def process_all_clusters_and_plot(self, gpkg_path, lat, lon, use_m2=False, simulation_time=10, time_zone="Europe/Madrid"):
+        """Complete processing pipeline"""
+        # Process data
+        df, geometries = self.process_all_clusters(gpkg_path, lat, lon, simulation_time, time_zone)
+        
+        # Save results
+        if df is not None:
+            self.save_to_csv(df, gpkg_path)
+        
+        # Plot results
+        self.plot_results(df, geometries, use_m2)
+        
+        return df
+
+
+class ProjectRunner:
+    def plot_all_buildings_side_by_side(self, base_dir="TFG/Dades/Edificis mostra TFG", 
+                                        lat=41.38879, lon=2.15899, 
+                                        simulation_time=10, time_zone="Europe/Madrid",
+                                        use_m2=False, max_per_figure=12):
+        import glob
+        from matplotlib.colors import Normalize, LinearSegmentedColormap
+        from matplotlib import cm
+        import math
+        from matplotlib.gridspec import GridSpec
+
+        building_results = {}
+        start_time = time.time()  # ⏱️ Tiempo global
+
+        # --- Process each building ---
+        for gpkg_path in glob.glob(os.path.join(base_dir, "*/Plane Identification/*.gpkg")):
+            building_id = os.path.basename(os.path.dirname(os.path.dirname(gpkg_path)))
+            start_time_building = time.time()  # ⏱️ Tiempo por edificio
+            try:
+                gdf = gpd.read_file(gpkg_path)
+                if len(gdf) == 0:
+                    print(f"⚠️ No clusters found in building {building_id}")
+                    continue
+                
+                # Procesar todos los clusters
+                temp_cluster_id = gdf['cluster'].iloc[0] if 'cluster' in gdf.columns else 1
+                csv_path = self.find_csv_for_cluster(gpkg_path, temp_cluster_id)
+                temp_cluster = Cluster(temp_cluster_id, gpkg_path, csv_path, lat, lon, simulation_time, time_zone)
+
+                simulator = PVlibSimulator(
+                    cluster=temp_cluster,
+                    tilt_dict={},
+                    panel_point_details=[],
+                    test_mode=False
+                )
+
+                # Procesar y guardar
+                df, geometries = self.process_and_save_building(simulator, gpkg_path, building_id, 
+                                                            lat, lon, simulation_time, time_zone)
+
+                if df is not None:
+                    building_results[building_id] = (df, geometries)
+
+                elapsed_building = time.time() - start_time_building
+                print(f"⏱️ Tiempo en procesar edificio {building_id}: {elapsed_building:.2f} segundos")
+
+            except Exception as e:
+                print(f"❌ Error procesando edificio {building_id}: {str(e)[:200]}")
+        
+        if not building_results:
+            print("⚠️ No se generaron resultados para ningún edificio.")
+            return
+        
+        # --- Global color normalization ---
+        energies = []
+        for df, _ in building_results.values():
+            if "energy_annual_kwh" in df.columns:
+                vals = df["energy_annual_kwh"].dropna().tolist()
+                energies.extend(vals)
+        if not energies:
+            print("⚠️ No hay datos de energía para graficar.")
+            return
+
+        vmin, vmax = min(energies), max(energies)
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        colors = [(0, 0, 1), (0.5, 0, 0.5), (1, 0, 0), (1, 1, 0)]
+        cmap = LinearSegmentedColormap.from_list("blue_purple_red_yellow", colors, N=256)
+
+        # ⭐⭐⭐ DIVIDIR ELS EDIFICIS EN GRUPS ⭐⭐⭐
+        n_buildings = len(building_results)
+        building_groups = []
+        for i in range(0, n_buildings, max_per_figure):
+            building_groups.append(dict(list(building_results.items())[i:i+max_per_figure]))
+
+        # Crear una figura per cada grup
+        figures = []  # 👈 Guardar referències a les figures
+        for group_idx, group_results in enumerate(building_groups):
+            n_buildings_group = len(group_results)
+            ncols = min(3, n_buildings_group)
+            nrows = math.ceil(n_buildings_group / ncols)
+            
+            fig = plt.figure(figsize=(6*ncols + 1, 6*nrows))
+            gs = GridSpec(nrows, ncols + 1, width_ratios=[1]*ncols + [0.05], 
+                        wspace=0.3, hspace=0.4)
+            
+            # --- Plot each building ---
+            for i, (building_id, (df, geometries)) in enumerate(group_results.items()):
+                row = i // ncols
+                col = i % ncols
+                
+                ax = fig.add_subplot(gs[row, col])
+                ax.set_aspect("equal")
+                
+                # clusters (azul claro)
+                for geom in geometries:
+                    if isinstance(geom, Polygon):
+                        x, y = geom.exterior.xy
+                        ax.fill(x, y, alpha=0.3, color="lightblue")
+                    else:
+                        for poly in geom.geoms:
+                            x, y = poly.exterior.xy
+                            ax.fill(x, y, alpha=0.3, color="lightblue")
+
+                # panels (coloreados por energía)
+                for _, row_data in df.iterrows():
+                    energy_val = row_data.get("energy_annual_kwh")
+                    geom = row_data.get("geometry")
+                    if pd.notna(energy_val) and isinstance(geom, Polygon):
+                        color = cmap(norm(energy_val))
+                        x, y = geom.exterior.xy
+                        ax.fill(x, y, alpha=0.8, color=color)
+                
+                ax.set_title(f"Edificio {building_id}", fontsize=14)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.grid(True, linestyle="--", alpha=0.3)
+
+            # --- Ocultar eixos sobrants ---
+            for i in range(len(group_results), nrows * ncols):
+                row = i // ncols
+                col = i % ncols
+                ax = fig.add_subplot(gs[row, col])
+                ax.set_visible(False)
+
+            # --- Barra de colors ---
+            cbar_ax = fig.add_subplot(gs[:, -1])
+            sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+            
+            label = "Energía anual (kWh/m²)" if use_m2 else "Energía anual (kWh)"
+            cbar = fig.colorbar(sm, cax=cbar_ax)
+            cbar.set_label(label, fontsize=12)
+            cbar.ax.tick_params(labelsize=10)
+
+            plt.suptitle(f"Edificis {group_idx*max_per_figure + 1}-{min((group_idx+1)*max_per_figure, n_buildings)} de {n_buildings}", fontsize=16)
+            plt.tight_layout()
+            
+            # Guardar figura
+            plt.savefig(f"edificis_grup_{group_idx+1}.png", dpi=300, bbox_inches='tight')
+            figures.append(fig)  # 👈 Guardar la figura
+            # ⚠️ NO posar plt.show() aquí!
+
+        # 👇 MOSTRAR TOT AL FINAL (opcional)
+        elapsed = time.time() - start_time
+        print(f"⏱️ Tiempo total plot_all_buildings_side_by_side: {elapsed:.2f} segundos")
+        plt.show()
+
+        return figures
+       
+    def process_and_save_building(self, simulator, gpkg_path, building_id, lat, lon, simulation_time, time_zone):
+        """
+        Processa TOTS els clusters d'un edifici i GUARDA els resultats a la carpeta 'Resultats'
+        """
+        try:
+            # Processar tots els clusters
+            df, geometries = simulator.process_all_clusters(
+                gpkg_path=gpkg_path,
+                lat=lat,
+                lon=lon,
+                simulation_time=simulation_time,
+                time_zone=time_zone
+            )
+            
+            if df is not None and not df.empty:
+                # 🔥 CREAR CARPETA Resultats i GUARDAR CSV
+                building_root = os.path.dirname(os.path.dirname(gpkg_path))
+                results_dir = os.path.join(building_root, "Resultats")
+                os.makedirs(results_dir, exist_ok=True)
+                
+                # Guardar CSV principal de l'edifici
+                main_csv_path = os.path.join(results_dir, f"resultats_{building_id}.csv")
+                df.to_csv(main_csv_path, sep=';', index=False, encoding='utf-8-sig')
+                print(f"✅ Resultats CSV guardats: {main_csv_path}")
+                
+                # Guardar CSV per a cada cluster
+                for cluster_id in df['cluster_id'].unique():
+                    cluster_df = df[df['cluster_id'] == cluster_id]
+                    cluster_csv_path = os.path.join(results_dir, f"cluster_{cluster_id}.csv")
+                    cluster_df.to_csv(cluster_csv_path, sep=';', index=False, encoding='utf-8-sig')
+                    print(f"  ✅ Cluster {cluster_id} CSV guardat")
+            
+            # 🔥 GUARDAR ELS GPKG AMB ELS PANELS OPTIMITZATS
+            self.save_cluster_gpkg(simulator, results_dir, building_id)
+            
+            return df, geometries
+            
+        except Exception as e:
+            print(f"❌ Error processant edifici {building_id}: {e}")
+            return None, None
+
+    def find_csv_for_cluster(self, gpkg_path, cluster_id):
+        """Find CSV with proper path handling"""
+        # Go up one level from Plane Identification to building folder
+        building_root = os.path.dirname(os.path.dirname(gpkg_path))
+        csv_dir = os.path.join(building_root, "Shading")
+        expected_csv = f"{cluster_id}.csv"
+        csv_path = os.path.normpath(os.path.join(csv_dir, expected_csv))
+        
+        if os.path.exists(csv_path):
+            return csv_path
+        
+        # Try alternative names
+        for alt_name in [f"cluster_{cluster_id}.csv", f"Cluster{cluster_id}.csv"]:
+            alt_path = os.path.join(csv_dir, alt_name)
+            if os.path.exists(alt_path):
+                return alt_path
+        
+        raise FileNotFoundError(f"No CSV found for cluster {cluster_id} in {csv_dir}")
+    
+    def save_cluster_gpkg(self, simulator, results_folder, building_id):
+        import geopandas as gpd
+        import os
+
+        os.makedirs(results_folder, exist_ok=True)
+
+        # Llegir tots els clusters del GPKG original
+        gdf_original = gpd.read_file(simulator.cluster.gpkg_path)
+        
+        # Crear un GeoDataFrame amb TOTS els panels optimitzats
+        all_panels_gdf = gpd.GeoDataFrame()
+        
+        # Processar cada cluster
+        for cluster_id in gdf_original['cluster'].unique() if 'cluster' in gdf_original.columns else [1]:
+            try:
+                # Crear el cluster object
+                csv_path = self.find_csv_for_cluster(simulator.cluster.gpkg_path, cluster_id)
+                cluster_obj = Cluster(cluster_id, simulator.cluster.gpkg_path, csv_path, 
+                                    simulator.cluster.lat, simulator.cluster.lon, 
+                                    simulator.cluster.simulation_time, simulator.cluster.time_zone)
+                
+                # Optimitzar panells per aquest cluster
+                optimizer = SolarPanelOptimizer(cluster_obj)
+                panels = optimizer.optimize_placement()
+                
+                if not panels:
+                    print(f"⚠️ No hi ha panells per al cluster {cluster_id}")
+                    continue
+                associator = PanelPointAssociator(cluster_obj, panels)
+                tilt_optimizer = TiltOptimizer(cluster_obj, associator.panel_point_details)
+                tilt_results = tilt_optimizer.compute_optimal_orientation()
+                # Crear GeoDataFrame per aquest cluster
+                cluster_data = []
+                for panel_id, panel_geom in enumerate(panels):
+                    # Obtenir el tilt per aquest panel
+                    tilt = tilt_results.get(panel_id, "NO ÚTIL")
+                    
+                    cluster_data.append({
+                        'panel_id': panel_id,
+                        'cluster_id': cluster_id,
+                        'building_id': building_id,
+                        'tilt_deg': tilt if isinstance(tilt, (int, float)) else None,
+                        'tilt_status': "UTIL" if isinstance(tilt, (int, float)) else "NO_UTIL",
+                        'geometry': panel_geom
+                    })
+                cluster_gdf = gpd.GeoDataFrame(cluster_data, geometry='geometry', crs=gdf_original.crs)
+                all_panels_gdf = pd.concat([all_panels_gdf, cluster_gdf], ignore_index=True)
+                
+                print(f"✅ Cluster {cluster_id}: {len(panels)} panells optimitzats")
+                
+            except Exception as e:
+                print(f"❌ Error processant cluster {cluster_id}: {e}")
+                continue
+        
+        # Guardar tots els panels en un sol GPKG
+        if not all_panels_gdf.empty:
+            # Guardar per building
+            building_gpkg_path = os.path.join(results_folder, f"panels_{building_id}.gpkg")
+            all_panels_gdf.to_file(building_gpkg_path, driver="GPKG")
+            print(f"✅ GeoPackage guardat: {building_gpkg_path} ({len(all_panels_gdf)} panells)")
+            
+            # Guardar per clusters individuals
+            for cluster_id in all_panels_gdf['cluster_id'].unique():
+                cluster_gdf = all_panels_gdf[all_panels_gdf['cluster_id'] == cluster_id]
+                cluster_gpkg_path = os.path.join(results_folder, f"panels_cluster_{cluster_id}.gpkg")
+                cluster_gdf.to_file(cluster_gpkg_path, driver="GPKG")
+                print(f"  ✅ Cluster {cluster_id}: {len(cluster_gdf)} panells")
+        
+        return all_panels_gdf
+  
+
+
+#gpkg_path="TFG/Dades/Edificis mostra TFG/672/Plane Identification/672.gpkg",
+#csv_path="TFG/Dades/Edificis mostra TFG/672/Shading Optimized/2.csv",
+
+#gpkg_path="TFG/Dades/Edificis mostra TFG/401/Plane Identification/401.gpkg",
+#csv_path="TFG/Dades/Edificis mostra TFG/401/Shading Optimized/2.csv",
+
+#gpkg_path="TFG/Dades/Edificis mostra TFG/86/Plane Identification/86.gpkg",
+#csv_path="TFG/Dades/Edificis mostra TFG/86/Shading Optimized/15.csv",
+
+#gpkg_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Plane Identification/115082126.gpkg",
+#csv_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Shading/1.csv",
+
+if __name__ == "__main__":
+    # 1. Initialize Cluster 
+    cluster = Cluster(
+        cluster_id=1,
+        gpkg_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Plane Identification/115082126.gpkg",
+        csv_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Shading/1.csv",
+        lat=41.38879,
+        lon=2.15899,
+        simulation_time=90,
+        time_zone="Europe/Madrid",
+        panel_w=1.0,
+        panel_l=1.7,    
+        sep_row=0.05
+    )
+
+    # 2. Optimize Panel Placement
+    optimizer = SolarPanelOptimizer(cluster)
+    panels = optimizer.optimize_placement()
+    optimizer.plot_edge_start_points()
+
+    print(f"Paneles colocados: {len(panels)}")
+    print(f"Área total: {sum(p.area for p in panels):.2f} m²")
+    print("\n=== Datos del cluster ===")
+    print(f"Cluster ID: {cluster.id}")
+    print(f"Tipo de geometría: {cluster.geometry.geom_type}")  # Debería ser 'Polygon' o 'MultiPolygon'
+    print(f"Área del cluster: {cluster.geometry.area:.2f} m²")  # Verifica que el área sea razonable
+
+
+    # 3. Associate Points with Panels
+    associator = PanelPointAssociator(
+        cluster=cluster,
+        solar_panels=panels,
+        border_distance=0.4,
+        near_distance=0.7,
+        inner_weight=1.0,
+        border_weight=0.8,
+        near_weight=0.24
+    )
+
+    # 4. Calculate Optimal Tilts
+    tilt_results = TiltOptimizer(cluster, associator.panel_point_details).compute_optimal_orientation()
+
+    # 5. Initialize Simulator
+    simulator = PVlibSimulator(cluster=cluster, tilt_dict=tilt_results,
+                            panel_point_details=associator.panel_point_details,
+                            )
+    plot_tilt_results(cluster.geometry, panels, tilt_results)
+    print(simulator.weather.index[0], simulator.weather.index[-1])
+   
+    simulator.plot_panel_power_and_horizon(panel_id=5, fecha='1990-01-21', window_minutes=1)
+    #simulator.compute_and_save_csv(filename="results450w.csv", workers=4)
+    simulator.info_important()
+    #simulator.plot_total_POA()
+    #simulator.plot_incident_vs_produced()
+
+    """simulator.process_all_clusters_and_plot(
+        gpkg_path=cluster.gpkg_path,
+        lat=cluster.lat,
+        lon=cluster.lon,
+        use_m2=False,
+        simulation_time=cluster.simulation_time,
+        time_zone=cluster.time_zone
+    )"""
+    
+    """runner = ProjectRunner()
+    runner.plot_all_buildings_side_by_side(
+        base_dir="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià",
+        lat=cluster.lat,
+        lon=cluster.lon,
+        simulation_time=cluster.simulation_time,  # 👈 Redueix per proves
+        time_zone=cluster.time_zone
+    )"""

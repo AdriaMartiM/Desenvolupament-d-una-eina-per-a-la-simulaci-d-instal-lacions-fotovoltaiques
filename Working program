@@ -30,6 +30,16 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.colors import Normalize
 from matplotlib import cm
 import time
+import glob
+import re
+import folium
+import json
+import topojson 
+from folium.features import TopoJson
+from branca.colormap import LinearColormap # Importación correcta
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
 
 class Cluster:
     """ Aquesta clase serveix per inicialitzar totes les cariables que ens faran falta mes endevant, d'aquesta manera
@@ -43,7 +53,7 @@ class Cluster:
             -Creem un plot per les dades
         No hi ha cap plot ben fet doncs ja tinc un altre arxiu més centrat a fer plots de grafiques
     """
-    def __init__(self, cluster_id: int, gpkg_path: str, csv_path: str, lat: float, lon: float, simulation_time: float, time_zone: str, panel_w=1.0, panel_l=1.7, sep_row=0.05,):
+    def __init__(self, cluster_id: int, gpkg_path: str, csv_path: str, lat: float, lon: float, simulation_time: float, time_zone: str, panel_w=1.0, panel_l=1.7, sep_row=0.05, base_dir: str=""):
         self.id = cluster_id
         self.gpkg_path = gpkg_path
         self.csv_path = csv_path
@@ -54,6 +64,7 @@ class Cluster:
         self.panel_w = panel_w
         self.panel_l = panel_l
         self.sep_row = sep_row 
+        self.base_dir = base_dir
 
         self.azimuth = None
         self.tilt = None
@@ -1678,6 +1689,101 @@ class PVlibSimulator:
         plt.grid(axis="y", linestyle="--", alpha=0.5)
         plt.show()
 
+    def save_cluster_heatmap_png(self, cluster_obj, output_path: str, global_norm=None, cmap=None):
+        """
+        Genera y guarda un heatmap de POA para un clúster específico.
+        """
+        print(f"    > Generando Heatmap PNG para Clúster {cluster_obj.id}...")
+        try:
+            # 1. Obtener datos de POA (como en tu función plot_total_POA)
+            points, values = self._get_poa_samples(cluster=cluster_obj, max_points=1000) # Límite de 1000 puntos para rapidez
+            if len(values) == 0:
+                print(f"    > Advertencia: No se generaron valores de POA para el heatmap.")
+                return
+
+            # 2. Crear la figura
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # 3. Interpolar y dibujar (usando tu lógica de _plot_single_heatmap)
+            x_min, y_min, x_max, y_max = cluster_obj.geometry.bounds
+            xi, yi = np.meshgrid(
+                np.linspace(x_min, x_max, 150), # 150x150 de resolución
+                np.linspace(y_min, y_max, 150)
+            )
+            rbf = Rbf(points[:,0], points[:,1], values, function='thin_plate')
+            zi = rbf(xi, yi)
+            
+            mask = np.array([[not cluster_obj.geometry.contains(Point(x, y)) 
+                            for x, y in zip(xi.ravel(), yi.ravel())]]).reshape(xi.shape)
+            zi[mask] = np.nan
+
+            # 4. Usar el colormap (el de tu TFG o uno estándar)
+            if cmap is None:
+                cmap = LinearSegmentedColormap.from_list('thermal', ['#0000FF', '#FF0000', '#FFFF00'])
+            if global_norm is None:
+                global_norm = Normalize(vmin=min(values), vmax=max(values))
+
+            contour = ax.contourf(xi, yi, zi, levels=20, cmap=cmap, norm=global_norm, alpha=0.9)
+            
+            # Dibujar el borde del clúster
+            if isinstance(cluster_obj.geometry, Polygon):
+                x, y = cluster_obj.geometry.exterior.xy
+                ax.plot(x, y, 'k-', linewidth=0.8)
+            else:
+                for poly in cluster_obj.geometry.geoms:
+                    x, y = poly.exterior.xy
+                    ax.plot(x, y, 'k-', linewidth=0.8)
+            
+            # 5. Añadir Título y Guardar
+            ax.set_title(f"Heatmap POA - Clúster {cluster_obj.id}\nEdificio {os.path.basename(os.path.dirname(os.path.dirname(cluster_obj.gpkg_path)))}")
+            ax.set_aspect('equal')
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            plt.colorbar(contour, ax=ax, label='POA Anual (kWh/m²)')
+            
+            fig.savefig(output_path, dpi=150, bbox_inches='tight') # dpi=150 es bueno para informes
+            plt.close(fig) # ¡MUY IMPORTANTE para liberar memoria!
+            
+        except Exception as e:
+            plt.close('all')
+            print(f"    > ❌ Error al guardar heatmap: {e}")
+
+    def save_cluster_summary_csv(self, cluster_obj, panel_data_df: pd.DataFrame, output_path: str):
+        """
+        Calcula la radiación incidente vs. producida y guarda un CSV de resumen.
+        """
+        print(f"    > Generando Resumen CSV para Clúster {cluster_obj.id}...")
+        try:
+            # 1. Calcular Radiación Incidente (POA) Media del Clúster
+            # (Usamos los puntos de shading, no los paneles)
+            points, values_poa = self._get_poa_samples(cluster=cluster_obj, max_points=500)
+            poa_media_kwh_m2 = np.mean(values_poa) if len(values_poa) > 0 else 0.0
+
+            # 2. Calcular Energía Producida (desde el CSV de paneles)
+            # Aseguramos que las columnas estén en minúsculas
+            panel_data_df = panel_data_df.rename(columns={col: col.lower() for col in panel_data_df.columns})
+            
+            energia_total_kwh = panel_data_df['energy_annual_kwh'].sum()
+            energia_media_kwh_panel = panel_data_df['energy_annual_kwh'].mean()
+            num_paneles = len(panel_data_df)
+            
+            # 3. Crear el DataFrame de resumen
+            summary_data = {
+                'cluster_id': cluster_obj.id,
+                'numero_paneles': num_paneles,
+                'energia_total_producida_kwh': energia_total_kwh,
+                'energia_media_por_panel_kwh': energia_media_kwh_panel,
+                'radiacion_incidente_media_kwh_m2': poa_media_kwh_m2
+            }
+            summary_df = pd.DataFrame([summary_data])
+            
+            # 4. Guardar en CSV
+            summary_df.to_csv(output_path, sep=';', index=False, encoding='utf-8-sig')
+
+        except Exception as e:
+            print(f"    > ❌ Error al guardar resumen CSV: {e}")
+
+
 
     def process_all_clusters(self, gpkg_path, lat, lon, simulation_time=10, time_zone="Europe/Madrid"):
         
@@ -2002,7 +2108,7 @@ class ProjectRunner:
         Processa TOTS els clusters d'un edifici i GUARDA els resultats a la carpeta 'Resultats'
         """
         try:
-            # Processar tots els clusters
+            # Procesar todos los clusters (esto ya lo haces)
             df, geometries = simulator.process_all_clusters(
                 gpkg_path=gpkg_path,
                 lat=lat,
@@ -2012,27 +2118,55 @@ class ProjectRunner:
             )
             
             if df is not None and not df.empty:
-                # 🔥 CREAR CARPETA Resultats i GUARDAR CSV
+                # CREAR CARPETA Resultats (esto ya lo haces)
                 building_root = os.path.dirname(os.path.dirname(gpkg_path))
                 results_dir = os.path.join(building_root, "Resultats")
                 os.makedirs(results_dir, exist_ok=True)
                 
-                # Guardar CSV principal de l'edifici
+                # Guardar CSV principal (esto ya lo haces)
                 main_csv_path = os.path.join(results_dir, f"resultats_{building_id}.csv")
                 df.to_csv(main_csv_path, sep=';', index=False, encoding='utf-8-sig')
                 print(f"✅ Resultats CSV guardats: {main_csv_path}")
                 
-                # Guardar CSV per a cada cluster
+                # --- BUCLE MODIFICADO ---
+                # Guardar CSV y AÑADIR HEATMAP + RESUMEN
                 for cluster_id in df['cluster_id'].unique():
                     cluster_df = df[df['cluster_id'] == cluster_id]
+                    
+                    # 1. Guardar CSV del cluster (Tu código)
                     cluster_csv_path = os.path.join(results_dir, f"cluster_{cluster_id}.csv")
                     cluster_df.to_csv(cluster_csv_path, sep=';', index=False, encoding='utf-8-sig')
                     print(f"  ✅ Cluster {cluster_id} CSV guardat")
-            
-            # 🔥 GUARDAR ELS GPKG AMB ELS PANELS OPTIMITZATS
-            self.save_cluster_gpkg(simulator, results_dir, building_id)
-            
-            return df, geometries
+
+                    # --- ¡¡AQUÍ AÑADES LO NUEVO!! ---
+                    try:
+                        # 2. Cargar el objeto Cluster (necesario para shading y geometría)
+                        csv_shading_path = self.find_csv_for_cluster(gpkg_path, cluster_id)
+                        cluster_obj = Cluster(
+                            cluster_id=cluster_id,
+                            gpkg_path=gpkg_path,
+                            csv_path=csv_shading_path,
+                            lat=lat, lon=lon, 
+                            simulation_time=simulation_time, time_zone=time_zone
+                        )
+                        
+                        # 3. Guardar el Heatmap PNG
+                        heatmap_path = os.path.join(results_dir, f"heatmap_cluster_{cluster_id}.png")
+                        simulator.save_cluster_heatmap_png(cluster_obj, heatmap_path)
+                        print(f"  ✅ Cluster {cluster_id} Heatmap PNG guardat")
+
+                        # 4. Guardar el Resumen CSV
+                        summary_path = os.path.join(results_dir, f"summary_cluster_{cluster_id}.csv")
+                        simulator.save_cluster_summary_csv(cluster_obj, cluster_df, summary_path)
+                        print(f"  ✅ Cluster {cluster_id} Resumen CSV guardat")
+
+                    except Exception as e:
+                        print(f"  ❌ Error al generar archivos extra para cluster {cluster_id}: {e}")
+                
+                # Guardar GPKG de paneles (Tu código)
+                self.save_cluster_gpkg(simulator, results_dir, building_id)
+                
+                return df, geometries
             
         except Exception as e:
             print(f"❌ Error processant edifici {building_id}: {e}")
@@ -2128,7 +2262,537 @@ class ProjectRunner:
         return all_panels_gdf
   
 
+import folium
+import geopandas as gpd
+import pandas as pd
+import os
+import glob
+import re
+import json
+import topojson 
+from folium.features import TopoJson
+from branca.colormap import LinearColormap
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
+from shapely.geometry import Polygon
 
+class FoliumMapGenerator:
+    """
+    Genera un mapa donde cada EDIFICIO tiene un popup con Menú Lateral.
+    Incluye pestaña de 'Visión General' con todo el edificio y pestañas por Tejado.
+    """
+    
+    def __init__(self, main_project_dir: str):
+        self.main_project_dir = os.path.abspath(main_project_dir)
+        self.lista_master_paneles = [] 
+        self.lista_master_techos = [] 
+        self.master_data_dict = {} 
+        self.crs_original = None
+        self.join_key = None 
+        self.colormap = None
+        self.norm = None 
+        print(f"Map Generator: Buscando edificios en: {self.main_project_dir}")
+
+    # --- 1. GRÁFICO MENSUAL ---
+    def _create_monthly_plot(self, cluster_data: pd.DataFrame) -> str:
+        try:
+            cluster_data = cluster_data.rename(columns={col: col.lower() for col in cluster_data.columns})
+            month_cols = [f'energy_kwh_month_{m:02d}' for m in range(1, 13)]
+            if not all(col in cluster_data.columns for col in month_cols): return "<p>Sin datos mensuales.</p>"
+            monthly = cluster_data[month_cols].sum()
+            monthly.index = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+            
+            fig, ax = plt.subplots(figsize=(5.0, 3.0), dpi=100) 
+            monthly.plot(kind='bar', ax=ax, color='#003366', zorder=3, width=0.7)
+            ax.set_ylabel("Energía (kWh)", fontsize=9)
+            ax.tick_params(axis='x', labelsize=9, rotation=45)
+            ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
+            fig.tight_layout()
+            
+            buf = BytesIO()
+            fig.savefig(buf, format='png')
+            plt.close(fig) 
+            data = base64.b64encode(buf.getvalue()).decode('utf-8')
+            return f'<img src="data:image/png;base64,{data}" alt="Gráfico mensual">'
+        except: return "<p>Error gráfico mensual.</p>"
+
+    # --- 2. CARGAR IMAGEN HEATMAP ---
+    def _image_to_base64(self, file_path: str) -> str:
+        """Converteix una imatge a format base64 per incrustar-la en HTML."""
+        if not os.path.exists(file_path):
+            # Aquesta línia evita l'error TypeError
+            return f"<p style='color:#999;font-size:10px;text-align:center;'>⚠️ Imatge {os.path.basename(file_path)} no trobada.</p>"
+        
+        try:
+            with open(file_path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            style = "width:100%; border-radius:5px; margin-top:5px; display:block;"
+            return f'<img src="data:image/png;base64,{encoded_string}" style="{style}">'
+        except Exception as e:
+            return f"<p style='color:red;font-size:10px;'>Error carregant imatge: {e}</p>"
+
+    def _create_panel_plot(self, panel_gdf: gpd.GeoDataFrame, cluster_geom: Polygon, is_overview=False) -> str:
+        """
+        Versión FINAL: 
+        1. Corrige el problema de gráficos en blanco usando adjustable='box'.
+        2. Restaura la escala de colores Azul-Rojo-Amarillo.
+        3. Mantiene la detección automática de Grados/Metros.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+        from io import BytesIO
+        import base64
+        import math
+
+        # Limpieza inicial
+        plt.close('all')
+
+        try:
+            # 1. Configurar figura
+            fig = plt.figure(figsize=(4, 3), dpi=80)
+            ax = fig.add_subplot(111)
+
+            # 2. Dibujar Fondo (Techo)
+            geo_ok = False
+            if cluster_geom is not None and not cluster_geom.is_empty:
+                try:
+                    gs = gpd.GeoSeries([cluster_geom])
+                    if gs.crs is None: gs.crs = "EPSG:4326"
+                    
+                    c_fondo = "#f0f0f0" if is_overview else "#dbeafe"
+                    gs.plot(ax=ax, color=c_fondo, edgecolor='#999999', alpha=0.5, linewidth=1)
+                    geo_ok = True
+                except Exception:
+                    pass
+
+            # 3. Dibujar Paneles con Color Correcto
+            if panel_gdf is not None and not panel_gdf.empty:
+                try:
+                    p = panel_gdf.copy()
+                    if p.crs is None: p.set_crs("EPSG:4326", allow_override=True)
+                    
+                    # Alinear CRS
+                    if geo_ok and hasattr(gs, 'crs') and gs.crs != p.crs:
+                        p = p.to_crs(gs.crs)
+                    
+                    # Definir Mapa de Color Personalizado (Azul -> Rojo -> Amarillo)
+                    colors = ["#0000FF", "#FF0000", "#FFFF00"]
+                    custom_cmap = LinearSegmentedColormap.from_list("custom_cmap", colors)
+
+                    col_e = next((c for c in p.columns if 'energy' in c.lower()), None)
+                    if col_e:
+                        vmin, vmax = p[col_e].min(), p[col_e].max()
+                        if vmin == vmax: vmax += 1 # Evitar error de rango nulo
+                        
+                        p.plot(ax=ax, column=col_e, cmap=custom_cmap, vmin=vmin, vmax=vmax, 
+                               edgecolor='black', linewidth=0.1)
+                    else:
+                        p.plot(ax=ax, color='blue', edgecolor='black', linewidth=0.1)
+                except Exception:
+                    pass
+
+            # 4. CORRECCIÓN DE LÍMITES (Geometría Segura)
+            x_min, x_max = ax.get_xlim()
+            y_min, y_max = ax.get_ylim()
+            
+            w = x_max - x_min
+            h = y_max - y_min
+
+            # Detectar unidades (Grados vs Metros)
+            es_grados = w < 1.0 or h < 1.0
+            margen_seguridad = 1e-5 if es_grados else 1.0
+
+            # Validación matemática
+            def is_bad(n): return math.isnan(n) or math.isinf(n)
+            
+            if is_bad(x_min) or is_bad(x_max) or is_bad(y_min) or is_bad(y_max):
+                x_min, x_max = 0, 10
+                y_min, y_max = 0, 10
+            else:
+                # Expandir si es muy pequeño para dar "cuerpo" al gráfico
+                if w < margen_seguridad:
+                    cx = (x_min + x_max) / 2
+                    x_min = cx - margen_seguridad
+                    x_max = cx + margen_seguridad
+                
+                if h < margen_seguridad:
+                    cy = (y_min + y_max) / 2
+                    y_min = cy - margen_seguridad
+                    y_max = cy + margen_seguridad
+
+            # Aplicar límites y quitar ejes
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_axis_off()
+
+            # 5. GUARDADO (Uso de 'box' para evitar blancos)
+            buf = BytesIO()
+            try:
+                # 'box' ajusta la caja del gráfico a los datos, no al revés.
+                ax.set_aspect('equal', adjustable='box')
+                fig.savefig(buf, format='png', transparent=True, pad_inches=0)
+            except Exception:
+                # Fallback a auto si falla la proporción
+                ax.set_aspect('auto')
+                buf = BytesIO()
+                fig.savefig(buf, format='png', transparent=True, pad_inches=0)
+
+            plt.close(fig)
+            data = base64.b64encode(buf.getvalue()).decode('utf-8')
+            
+            style = "width:100%; height:auto; border-radius:4px; margin-top:5px; display:block;"
+            if is_overview: style += " max-height: 250px; object-fit: contain;"
+            
+            return f'<img src="data:image/png;base64,{data}" style="{style}">'
+
+        except Exception as e:
+            plt.close('all')
+            return f"<p style='color:orange; font-size:10px;'>Error render: {str(e)}</p>"
+
+    def _create_colorbar(self) -> str:
+        """
+        Genera una barra de color (llegenda) com a imatge base64 
+        usant l'escala de color global del projecte (self.colormap).
+        """
+        # Importacions necessàries (si no estan a l'inici del teu fitxer)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+        from io import BytesIO
+        import base64
+        
+        cmap = self.colormap
+        norm = self.norm
+        
+        # Comprovem que l'escala global s'hagi inicialitzat correctament
+        if cmap is None or norm is None:
+            # Retorna un missatge d'error o buit si no hi ha escala
+            return "<p style='text-align:center; font-size:10px; color:#999;'>Llegenda no disponible (sense dades globals).</p>"
+
+        try:
+            fig, ax = plt.subplots(figsize=(6.0, 0.5)) # Figura petita i horitzontal
+            
+            # Creació de la barra de color utilitzant l'escala global
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([]) 
+            
+            # Dibuixem la barra de color
+            cbar = fig.colorbar(sm, cax=ax, orientation='horizontal', format='%.0f')
+            cbar.set_label('Energia Anual Mitjana per Panel (kWh)', fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+            
+            plt.tight_layout(pad=0.1)
+
+            # Convertim la figura a Base64
+            buf = BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, transparent=True)
+            plt.close(fig) 
+            data = base64.b64encode(buf.getvalue()).decode('utf-8')
+            
+            return f'<div style="text-align:center; padding:10px;"><img src="data:image/png;base64,{data}" style="max-width:90%; height:auto;"></div>'
+            
+        except Exception as e: 
+            plt.close('all')
+            print(f"Error generant la barra de color: {e}")
+            return ""
+
+    def _create_panel_table(self, panel_gdf: gpd.GeoDataFrame) -> str:
+        if panel_gdf is None or panel_gdf.empty: return ""
+        try:
+            panel_gdf = panel_gdf.rename(columns={col: col.lower() for col in panel_gdf.columns})
+            html = '<div class="table-container"><table class="modern-table">'
+            html += '<thead><tr><th>ID</th><th>Tilt</th><th>Gen.</th></tr></thead><tbody>'
+            
+            id_col = self.join_key if self.join_key else 'panel_id'
+            for _, row in panel_gdf.iterrows():
+                pid = row.get(id_col, 'N/A')
+                tilt = row.get('tilt_deg', 0)
+                gen = row.get('energy_annual_kwh', 0)
+                html += f"<tr><td>{pid}</td><td>{tilt:.0f}°</td><td>{gen:.0f}</td></tr>"
+            
+            html += '</tbody></table></div>'
+            return html
+        except: return ""
+
+    def create_map(self, output_filename: str = "mapa_TODOS_LOS_EDIFICIOS_FINAL.html"):
+        # 1. VERIFICACIONS
+        if not os.path.exists(self.main_project_dir):
+            print(f"❌ ERROR: No existe: {self.main_project_dir}")
+            return
+
+        building_folders = [f for f in glob.glob(os.path.join(self.main_project_dir, "*")) if os.path.isdir(f)]
+        print(f"Encontrados {len(building_folders)} edificios.")
+        original_roof_gdfs = {}
+
+        # 2. BUCLE DE PROCESAMIENTO
+        for building_path in building_folders:
+            b_id = os.path.basename(building_path)
+            if not b_id.isdigit(): continue
+            
+            # Rutas
+            ROOF_GPKG_PATH = os.path.join(building_path, "Plane Identification", f"{b_id}.gpkg")
+            RESULTS_DIR = os.path.join(building_path, "Resultats")
+
+            if not os.path.exists(ROOF_GPKG_PATH) or not os.path.exists(RESULTS_DIR): continue
+
+            # Cargar Techos
+            try:
+                gdf_r = gpd.read_file(ROOF_GPKG_PATH)
+                gdf_r.columns = map(str.lower, gdf_r.columns)
+                gdf_r['cluster'] = gdf_r['cluster'].astype(int)
+                if self.crs_original is None: self.crs_original = gdf_r.crs or "EPSG:25831"
+                if gdf_r.crs is None: gdf_r = gdf_r.set_crs(self.crs_original, allow_override=True)
+                original_roof_gdfs[b_id] = gdf_r.copy()
+            except: continue
+
+            # Cargar Paneles
+            local_panels = []
+            csv_files = glob.glob(os.path.join(RESULTS_DIR, "cluster_*.csv"))
+            id_extractor = re.compile(r"cluster_(\d+)\.csv")
+
+            for csv_path in csv_files:
+                try:
+                    fname = os.path.basename(csv_path)
+                    match = id_extractor.match(fname)
+                    if not match: continue
+                    c_id = int(match.group(1))
+                    
+                    df_d = pd.read_csv(csv_path, sep=';')
+                    df_d.columns = map(str.lower, df_d.columns)
+                    
+                    p_gpkg = os.path.join(RESULTS_DIR, f"panels_cluster_{c_id}.gpkg")
+                    if not os.path.exists(p_gpkg): p_gpkg = os.path.join(RESULTS_DIR, f"paneles_cluster_{c_id}.gpkg")
+                    if not os.path.exists(p_gpkg): continue
+                    
+                    gdf_p = gpd.read_file(p_gpkg)
+                    gdf_p.columns = map(str.lower, gdf_p.columns)
+                    if gdf_p.crs is None: gdf_p = gdf_p.set_crs(self.crs_original, allow_override=True)
+                    
+                    self.join_key = 'panel_id'
+                    if 'point_id' in df_d.columns and 'point_id' in gdf_p.columns: self.join_key = 'point_id'
+                    if self.join_key not in df_d.columns or self.join_key not in gdf_p.columns: continue
+                    
+                    gdf_p[self.join_key] = pd.to_numeric(gdf_p[self.join_key], errors='coerce')
+                    df_d[self.join_key] = pd.to_numeric(df_d[self.join_key], errors='coerce')
+                    gdf_m = gdf_p.merge(df_d, on=self.join_key)
+                    
+                    if 'geometry_x' in gdf_m.columns:
+                        if 'geometry_y' in gdf_m.columns: gdf_m = gdf_m.drop(columns=['geometry_y'])
+                        gdf_m = gdf_m.rename(columns={'geometry_x': 'geometry'}).set_geometry('geometry')
+                    
+                    if len(gdf_m) == 0: continue
+                    if 'energy_annual_kwh' not in gdf_m.columns: gdf_m['energy_annual_kwh'] = 0
+                    
+                    # ### !!! IMPORTANTE !!! ESTAS DOS LÍNEAS ARREGLAN EL KEYERROR ###
+                    gdf_m['building_id'] = b_id
+                    gdf_m['cluster_id'] = c_id 
+                    # ##############################################################
+
+                    local_panels.append(gdf_m)
+                    self.master_data_dict[(b_id, c_id)] = gdf_m
+                except: pass
+
+            # Unir al edificio
+            if local_panels:
+                self.lista_master_paneles.extend(local_panels)
+                df_all = pd.concat(local_panels)
+                
+                # AHORA ESTO SÍ FUNCIONARÁ PORQUE 'cluster_id' EXISTE
+                # MODIFICADO: Añadido el cálculo de la MEDIA
+                df_grp = df_all.groupby('cluster_id').agg(
+                    numero_paneles=(self.join_key, 'count'),
+                    energia_anual_kWh=('energy_annual_kwh', 'sum'),
+                    energia_mitjana_kWh=('energy_annual_kwh', 'mean') # <--- NUEVO CAMPO AGREGADO
+                ).reset_index().rename(columns={'cluster_id': 'cluster'})
+                
+                # AHORA ESTO SÍ FUNCIONARÁ PORQUE 'cluster_id' EXISTE
+                
+                gdf_b = gdf_r.merge(df_grp, on='cluster', how='left')
+            else:
+                gdf_b = gdf_r
+            
+            gdf_b['building_id'] = b_id
+            self.lista_master_techos.append(gdf_b)
+
+        if not self.lista_master_techos: 
+            print("❌ No hay datos.")
+            return
+
+        # 3. GENERAR MAPA
+        print("Generando Mapa HTML...")
+        gdf_TECHOS_FINAL = gpd.GeoDataFrame(pd.concat(self.lista_master_techos, ignore_index=True), crs=self.crs_original).to_crs(epsg=4326)
+        
+        gdf_PANEL_WEB = None
+        if self.lista_master_paneles:
+            gdf_PANEL_FINAL = gpd.GeoDataFrame(pd.concat(self.lista_master_paneles, ignore_index=True), crs=self.crs_original)
+            gdf_PANEL_WEB = gdf_PANEL_FINAL.to_crs(epsg=4326)
+
+        bounds = gdf_TECHOS_FINAL.total_bounds
+        m = folium.Map(location=[(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2], zoom_start=18)
+        folium.TileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google', name='Google Satellite', overlay=True).add_to(m)
+
+        # Capa Paneles
+        if gdf_PANEL_WEB is not None and 'energy_annual_kwh' in gdf_PANEL_WEB.columns:
+            layer_p = folium.FeatureGroup(name='Paneles', control=True).add_to(m)
+            min_e, max_e = gdf_PANEL_WEB['energy_annual_kwh'].min(), gdf_PANEL_WEB['energy_annual_kwh'].max()
+            if min_e == max_e: max_e += 1.0
+            self.colormap = LinearColormap(['#0000FF', '#FF0000', '#FFFF00'], vmin=min_e, vmax=max_e)
+            self.norm = plt.Normalize(vmin=min_e, vmax=max_e)
+            self.colormap.add_to(m)
+            
+            # --- INSERCIÓ DE LA BARRA DE COLOR ---
+            # IMPORTANT: Assegureu-vos d'haver importat 'folium' al vostre fitxer principal.
+            from folium import Element 
+            colorbar_html = self._create_colorbar()
+            if colorbar_html:
+                # Aquesta línia inyecta el HTML de la barra de color al cos del document del mapa
+                Element(colorbar_html).add_to(m.get_root().html) 
+            # -------------------------------------
+            
+            gdf_PANEL_WEB['tooltip'] = gdf_PANEL_WEB['energy_annual_kwh'].round(0)
+            topo = topojson.Topology(gdf_PANEL_WEB, prevent_oversimplify=True)
+            TopoJson(json.loads(topo.to_json()), 'objects.data', name='Paneles',
+                style_function=lambda x: {'fillColor': self.colormap(x['properties']['energy_annual_kwh']), 'color': 'black', 'weight': 0.1, 'fillOpacity': 0.8},
+                tooltip=folium.features.GeoJsonTooltip(fields=['tooltip'], aliases=['kWh/Panel:']) # MODIFICADO: Etiqueta
+            ).add_to(layer_p)
+
+        # 4. CAPA TECHOS (DISEÑO SIDEBAR)
+        layer_e = folium.FeatureGroup(name='Edificios').add_to(m)
+        
+        for b_id, b_data in gdf_TECHOS_FINAL.groupby('building_id'):
+            
+            sidebar_html = f"""
+            <div class="sidebar">
+                <div class="sidebar-header"><h3>Edif. {b_id}</h3><p>Selecciona Tejado:</p></div>
+                <div class="btn-group">
+            """
+            content_html = '<div class="content-area">'
+            
+            # PESTAÑA HOME
+            # Preparar imagen overview
+            all_panels = []
+            for c_id_temp in b_data['cluster']:
+                p_dat = self.master_data_dict.get((str(b_id), c_id_temp))
+                if p_dat is not None: all_panels.append(p_dat)
+            
+            img_ov = "<p>Sin paneles</p>"
+            if all_panels:
+                full_gdf = pd.concat(all_panels)
+                img_ov = self._create_panel_plot(full_gdf, b_data.geometry.unary_union, is_overview=True)
+
+            t_pan = b_data['numero_paneles'].sum()
+            t_en = b_data['energia_anual_kWh'].sum()
+            t_avg = t_en / t_pan if t_pan > 0 else 0 # MODIFICADO: Cálculo de la media global
+            
+            sidebar_html += f"""<button class="nav-btn active" onclick="openTab(event, 'home-{b_id}')">🏠 Visión General</button>"""
+            # MODIFICADO: Bloque de estadísticas con 3 columnas (Total Paneles, Energía Total, Energía Media)
+            content_html += f""" 	
+            <div id="home-{b_id}" class="tab-content" style="display:block;">
+                <h2 class="main-title">Resumen Global</h2>
+                <div style="text-align:center; margin-bottom:20px;">{img_ov}</div>
+                <div class="stats-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+                    <div class="stat-item"><div style="font-size:20px;color:#003366;font-weight:bold">{int(t_pan)}</div><div style="font-size:10px">PANELES</div></div>
+                    <div class="stat-item"><div style="font-size:20px;color:#003366;font-weight:bold">{t_en/1000:.1f} MWh</div><div style="font-size:10px">ENERGÍA TOTAL</div></div>
+                    <div class="stat-item"><div style="font-size:20px;color:#003366;font-weight:bold">{t_avg:.0f} kWh</div><div style="font-size:10px">ENERGÍA MEDIA/PANEL</div></div>
+                </div>
+                <p style="text-align:center; font-size:11px; color:#999; margin-top:20px;">⬇ Selecciona un tejado para detalles ⬇</p>
+            </div>
+            """
+
+            # PESTAÑAS INDIVIDUALES
+            for idx, row in b_data.iterrows():
+                c_id = row['cluster']
+                res_dir = os.path.join(self.main_project_dir, str(b_id), "Resultats")
+                heat_png = os.path.join(res_dir, f"heatmap_cluster_{c_id}.png")
+                
+                try:
+                    orig = original_roof_gdfs.get(str(b_id))
+                    g_dat = orig[orig['cluster'] == c_id].iloc[0]
+                    poly, area, tilt, az = g_dat.geometry, g_dat.geometry.area, g_dat.get('tilt',0), g_dat.get('azimuth',0)
+                except: 
+                    poly, area, tilt, az = row.geometry, 0, 0, 0
+
+                num = row.get('numero_paneles', 0)
+                if pd.isna(num) or num == 0:
+                    sidebar_html += f"""<button class="nav-btn disabled">Tejado {c_id} (X)</button>"""
+                else:
+                    e_tot = row.get('energia_anual_kWh', 0)
+                    e_avg = row.get('energia_mitjana_kWh', 0) # MODIFICADO: Lectura de la media
+                    poa = 0 # Cargar poa si existe... (resumido)
+                    
+                    dat = self.master_data_dict.get((str(b_id), c_id))
+                    
+                    sidebar_html += f"""<button class="nav-btn" onclick="openTab(event, 'tab-{b_id}-{c_id}')">Tejado {c_id}</button>"""
+                    # MODIFICADO: Bloque de estadísticas del detalle del clúster (4 columnas)
+                    content_html += f"""
+                    <div id="tab-{b_id}-{c_id}" class="tab-content" style="display:none;">
+                        <h3 class="main-title">Tejado {c_id} <span style="float:right;font-size:12px;color:#666">{int(num)} Paneles</span></h3>
+                        <div class="stats-grid">
+                            <div class="stat-item"><b>A:</b> {area:.0f}m²</div>
+                            <div class="stat-item"><b>T:</b> {tilt:.0f}°</div>
+                            <div class="stat-item"><b>E Tot:</b> {e_tot:.0f} kWh</div>
+                            <div class="stat-item"><b>E Med:</b> {e_avg:.0f} kWh</div>
+                        </div>
+                        
+                        <h4 class="sec-title">Mapa de Calor</h4> {self._image_to_base64(heat_png)}
+                        <h4 class="sec-title">Disposición</h4> {self._create_panel_plot(dat, poly)}
+                        
+                        <h4 class="sec-title">Mensual</h4> {self._create_monthly_plot(dat)}  
+                        <h4 class="sec-title">Detalle Paneles</h4> {self._create_panel_table(dat)}  
+                        
+                    </div>
+                    """
+
+            sidebar_html += "</div></div>"
+            content_html += "</div>"
+
+            full_html = f"""
+            <html><head><style>
+                body {{ margin:0; padding:0; font-family: 'Segoe UI', sans-serif; display: flex; width: 750px; height: 550px; }}
+                .sidebar {{ width: 160px; background: #f4f4f4; border-right: 1px solid #ccc; display: flex; flex-direction: column; }}
+                .sidebar-header {{ background: #003366; color: white; padding: 10px; text-align: center; }}
+                .btn-group {{ padding: 10px; overflow-y: auto; flex: 1; }}
+                .nav-btn {{ width: 100%; padding: 8px; margin-bottom: 5px; border: 1px solid #ddd; background: #fff; text-align: left; cursor: pointer; font-size: 11px; border-radius: 3px; }}
+                .nav-btn:hover {{ background: #e9e9e9; }}
+                .nav-btn.active {{ background: #003366; color: white; }}
+                .nav-btn.disabled {{ color: #aaa; cursor: default; background: #f9f9f9; }}
+                .content-area {{ flex: 1; padding: 20px; overflow-y: auto; background: white; }}
+                .main-title {{ color: #003366; border-bottom: 2px solid #003366; margin: 0 0 10px 0; font-size: 18px; }}
+                .sec-title {{ color: #004a99; border-bottom: 1px solid #eee; margin: 20px 0 5px 0; font-size: 12px; font-weight: bold; text-transform: uppercase; }}
+                .stats-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
+                .stat-item {{ background: #f8f9fa; padding: 5px; border: 1px solid #eee; text-align: center; font-size: 10px; border-radius: 4px; }}
+                .table-container {{ max-height: 150px; overflow-y: auto; border: 1px solid #eee; margin-top: 5px; }}
+                .modern-table {{ width: 100%; border-collapse: collapse; font-size: 10px; }}
+                .modern-table th {{ position: sticky; top: 0; background: #003366; color: white; padding: 5px; text-align: center; }}
+                .modern-table td {{ padding: 4px; border-bottom: 1px solid #eee; text-align: center; }}
+                .modern-table tr:nth-child(even) {{ background: #f8f9fa; }}
+                img {{ max-width: 100%; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+                @keyframes fade {{ from {{opacity: 0;}} to {{opacity: 1;}} }} .tab-content {{ animation: fade 0.4s; }}
+            </style>
+            <script>
+                function openTab(evt, id) {{
+                    var cs = document.getElementsByClassName("tab-content");
+                    for (var i=0; i<cs.length; i++) cs[i].style.display = "none";
+                    var ls = document.getElementsByClassName("nav-btn");
+                    for (var i=0; i<ls.length; i++) ls[i].className = ls[i].className.replace(" active", "");
+                    document.getElementById(id).style.display = "block";
+                    evt.currentTarget.className += " active";
+                }}
+            </script></head>
+            <body>{sidebar_html}{content_html}</body></html>
+            """
+
+            if not b_data.empty:
+                combined = b_data.geometry.unary_union
+                iframe = folium.IFrame(full_html, width=770, height=570)
+                popup = folium.Popup(iframe, max_width=770)
+                folium.GeoJson(combined, style_function=lambda x: {'fillColor':'grey', 'color':'white', 'weight':1, 'fillOpacity':0.01}, popup=popup).add_to(layer_e)
+
+        folium.LayerControl().add_to(m)
+        output_path = os.path.join(self.main_project_dir, output_filename)
+        m.save(output_path)
+        print(f"\n🎉 Mapa guardado: {output_path}")
+           
 #gpkg_path="TFG/Dades/Edificis mostra TFG/672/Plane Identification/672.gpkg",
 #csv_path="TFG/Dades/Edificis mostra TFG/672/Shading Optimized/2.csv",
 
@@ -2138,24 +2802,25 @@ class ProjectRunner:
 #gpkg_path="TFG/Dades/Edificis mostra TFG/86/Plane Identification/86.gpkg",
 #csv_path="TFG/Dades/Edificis mostra TFG/86/Shading Optimized/15.csv",
 
-#gpkg_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Plane Identification/115082126.gpkg",
-#csv_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Shading/1.csv",
+#gpkg_path="TFG/Dades/Sample 54 edificis Adrià (1)/Sample 54 edifics Adrià/115082126/Plane Identification/115082126.gpkg",
+#csv_path="TFG/Dades/Sample 54 edificis Adrià (1)/Sample 54 edifics Adrià/115082126/Shading/1.csv",
 
 if __name__ == "__main__":
     # 1. Initialize Cluster 
     cluster = Cluster(
         cluster_id=1,
-        gpkg_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Plane Identification/115082126.gpkg",
-        csv_path="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià/115082126/Shading/1.csv",
+        gpkg_path = r"Dades\Sample 54 edificis Adrià (1)\Sample 54 edifics Adrià\115085475\Plane Identification\115085475.gpkg",
+        csv_path=r"Dades\Sample 54 edificis Adrià (1)\Sample 54 edifics Adrià\115085475\Shading\1.csv",
         lat=41.38879,
         lon=2.15899,
         simulation_time=90,
         time_zone="Europe/Madrid",
         panel_w=1.0,
         panel_l=1.7,    
-        sep_row=0.05
+        sep_row=0.05,
+        base_dir="Dades/Sample 54 edificis Adrià (1)/Sample 54 edifics Adrià"
     )
-
+    
     # 2. Optimize Panel Placement
     optimizer = SolarPanelOptimizer(cluster)
     panels = optimizer.optimize_placement()
@@ -2187,12 +2852,12 @@ if __name__ == "__main__":
     simulator = PVlibSimulator(cluster=cluster, tilt_dict=tilt_results,
                             panel_point_details=associator.panel_point_details,
                             )
-    #plot_tilt_results(cluster.geometry, panels, tilt_results)
+    plot_tilt_results(cluster.geometry, panels, tilt_results)
     print(simulator.weather.index[0], simulator.weather.index[-1])
    
     #simulator.plot_panel_power_and_horizon(panel_id=5, fecha='1990-01-21', window_minutes=1)
     #simulator.compute_and_save_csv(filename="results450w.csv", workers=4)
-    simulator.info_important()
+    #simulator.info_important()
     #simulator.plot_total_POA()
     #simulator.plot_incident_vs_produced()
 
@@ -2205,11 +2870,16 @@ if __name__ == "__main__":
         time_zone=cluster.time_zone
     )"""
     
-    runner = ProjectRunner()
+    """runner = ProjectRunner()
     runner.plot_all_buildings_side_by_side(
-        base_dir="TFG/Dades/Sample 54 edifics Adrià (1)/Sample 54 edifics Adrià",
+        base_dir=cluster.base_dir,
         lat=cluster.lat,
         lon=cluster.lon,
         simulation_time=cluster.simulation_time,  # 👈 Redueix per proves
         time_zone=cluster.time_zone
+    )"""
+
+    map_generator = FoliumMapGenerator(
+        main_project_dir=cluster.base_dir
     )
+    map_generator.create_map()
